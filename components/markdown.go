@@ -87,21 +87,34 @@ func MarkdownLookFor(theme ui.Theme) MarkdownLook {
 // MarkdownSelection is a range of the rendered text of a MarkdownView, in byte
 // offsets. Anchor is where the user began and Focus is where the pointer is now;
 // either may be ahead of the other. Range clamps and orders them against the
-// view's text length, so a selection that was made before a message changed
-// still copies the part that is there.
+// view's text, so a selection that was made before a message changed still
+// copies the part that is there.
 type MarkdownSelection struct {
 	Anchor, Focus int
 }
 
-// Range returns the selected bytes, ordered and clamped to [0, textLen].
-func (s MarkdownSelection) Range(textLen int) (start, end int) {
+// Range returns the selected bytes, ordered and clamped to text. Clamping snaps
+// both ends back to the start of the rune they point into, because a selection
+// kept while a streaming message shortened can land inside a multi-byte
+// character; without the snap SelectedText would return invalid UTF-8.
+func (s MarkdownSelection) Range(text []byte) (start, end int) {
 	start, end = s.Anchor, s.Focus
 	if start > end {
 		start, end = end, start
 	}
-	start = min(max(start, 0), textLen)
-	end = min(max(end, 0), textLen)
+	start = snapRune(text, min(max(start, 0), len(text)))
+	end = snapRune(text, min(max(end, 0), len(text)))
 	return start, end
+}
+
+// snapRune moves offset back to the leading byte of the rune it points into.
+// Offsets that are already at a boundary, including len(text), are returned as
+// they are.
+func snapRune(text []byte, offset int) int {
+	for offset > 0 && offset < len(text) && text[offset]&0xC0 == 0x80 {
+		offset--
+	}
+	return offset
 }
 
 // MarkdownCode is a fenced code block of a laid-out document: where it is, so
@@ -131,6 +144,8 @@ type MarkdownPaint struct {
 	Selection MarkdownSelection
 }
 
+var _ ui.TextPlacement = (*MarkdownView)(nil)
+
 // MarkdownView lays out and paints a markdown.Document. It keeps the arrays it
 // builds, so laying out the next version of a message that is still being typed
 // allocates nothing once the view is warm. The zero value is ready; a view is
@@ -144,8 +159,6 @@ type MarkdownPaint struct {
 // Layout measures text and is the expensive half: do it when the text or the
 // width changed, and call Paint every frame. Proportional text has no italic
 // face yet, so emphasis is drawn a weight heavier than the text around it.
-var _ ui.TextPlacement = (*MarkdownView)(nil)
-
 type MarkdownView struct {
 	pieces     []mdPiece
 	runs       []mdCodeRun
@@ -180,7 +193,7 @@ func (v *MarkdownView) TextLen() int { return len(v.plain) }
 // puts on the clipboard. Offsets are clamped to the laid-out text, so an empty
 // view or a selection outside it returns "".
 func (v *MarkdownView) SelectedText(sel MarkdownSelection) string {
-	start, end := sel.Range(len(v.plain))
+	start, end := sel.Range(v.plain)
 	return string(v.plain[start:end])
 }
 
@@ -1268,7 +1281,7 @@ func (v *MarkdownView) Paint(canvas *ui.Canvas, p MarkdownPaint) {
 			canvas.Rounded(rect, 4, look.InlineCodeFill)
 		}
 	}
-	start, end := p.Selection.Range(len(v.plain))
+	start, end := p.Selection.Range(v.plain)
 	if start < end && look.Selection.Alpha > 0 {
 		for index := range v.pieces {
 			piece := &v.pieces[index]

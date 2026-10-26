@@ -39,28 +39,61 @@ func (v *MarkdownView) words() string {
 }
 
 func TestMarkdownSelectionRangeClampsAndOrders(t *testing.T) {
+	const digits = "0123456789" // ASCII, so every offset is a rune boundary
 	tests := []struct {
-		name    string
-		sel     MarkdownSelection
-		textLen int
-		start   int
-		end     int
+		name  string
+		sel   MarkdownSelection
+		text  string
+		start int
+		end   int
 	}{
-		{name: "empty", sel: MarkdownSelection{Anchor: 4, Focus: 4}, textLen: 10, start: 4, end: 4},
-		{name: "forward", sel: MarkdownSelection{Anchor: 2, Focus: 7}, textLen: 10, start: 2, end: 7},
-		{name: "reversed", sel: MarkdownSelection{Anchor: 7, Focus: 2}, textLen: 10, start: 2, end: 7},
-		{name: "negative", sel: MarkdownSelection{Anchor: -3, Focus: 4}, textLen: 10, start: 0, end: 4},
-		{name: "past the end", sel: MarkdownSelection{Anchor: 4, Focus: 99}, textLen: 10, start: 4, end: 10},
-		{name: "outside both ways", sel: MarkdownSelection{Anchor: -8, Focus: 99}, textLen: 10, start: 0, end: 10},
-		{name: "empty text", sel: MarkdownSelection{Anchor: -1, Focus: 3}, textLen: 0, start: 0, end: 0},
+		{name: "empty", sel: MarkdownSelection{Anchor: 4, Focus: 4}, text: digits, start: 4, end: 4},
+		{name: "forward", sel: MarkdownSelection{Anchor: 2, Focus: 7}, text: digits, start: 2, end: 7},
+		{name: "reversed", sel: MarkdownSelection{Anchor: 7, Focus: 2}, text: digits, start: 2, end: 7},
+		{name: "negative", sel: MarkdownSelection{Anchor: -3, Focus: 4}, text: digits, start: 0, end: 4},
+		{name: "past the end", sel: MarkdownSelection{Anchor: 4, Focus: 99}, text: digits, start: 4, end: 10},
+		{name: "outside both ways", sel: MarkdownSelection{Anchor: -8, Focus: 99}, text: digits, start: 0, end: 10},
+		{name: "empty text", sel: MarkdownSelection{Anchor: -1, Focus: 3}, text: "", start: 0, end: 0},
+		{name: "start inside a rune", sel: MarkdownSelection{Anchor: 3, Focus: 5}, text: "a 中", start: 2, end: 5},
+		{name: "end inside a rune", sel: MarkdownSelection{Anchor: 0, Focus: 4}, text: "a 中", start: 0, end: 2},
+		{name: "both inside a rune", sel: MarkdownSelection{Anchor: 4, Focus: 3}, text: "a 中", start: 2, end: 2},
+		{name: "clamped into a rune", sel: MarkdownSelection{Anchor: 3, Focus: 6}, text: "a 中", start: 2, end: 5},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			start, end := test.sel.Range(test.textLen)
+			start, end := test.sel.Range([]byte(test.text))
 			if start != test.start || end != test.end {
-				t.Fatalf("Range(%d) = %d..%d, want %d..%d", test.textLen, start, end, test.start, test.end)
+				t.Fatalf("Range(%q) = %d..%d, want %d..%d", test.text, start, end, test.start, test.end)
 			}
 		})
+	}
+}
+
+// A selection kept across a layout change used to be clamped to a shorter text
+// mid-rune, and SelectedText returned bytes that were not UTF-8. This is the
+// Motty streaming case: an unclosed backtick renders as literal text, then its
+// closing backtick turns "a `中" into "a 中", one byte shorter.
+func TestMarkdownSelectionClampedMidRuneIsValidUTF8(t *testing.T) {
+	var doc markdown.Document
+	var view MarkdownView
+	canvas := markdownCanvas()
+	style := MarkdownStyle{Size: 13, LineHeight: 18}
+	layout := func(source string) {
+		doc.Parse(source)
+		view.Layout(canvas, style, &doc, 400)
+	}
+	layout("a `中")
+	sel := MarkdownSelection{Anchor: 3, Focus: view.TextLen()}
+	if got := view.SelectedText(sel); got != "中" {
+		t.Fatalf("SelectedText before the change = %q, want %q", got, "中")
+	}
+	layout("a `中`")
+	got := view.SelectedText(sel)
+	if !utf8.ValidString(got) {
+		t.Fatalf("SelectedText after the change = %q, which is not valid UTF-8", got)
+	}
+	if got != "中" {
+		t.Fatalf("SelectedText after the change = %q, want %q", got, "中")
 	}
 }
 
