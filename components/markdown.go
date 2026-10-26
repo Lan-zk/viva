@@ -2,7 +2,6 @@ package components
 
 import (
 	"strconv"
-	"strings"
 	"unicode/utf8"
 	"unsafe"
 
@@ -68,17 +67,40 @@ type MarkdownLook struct {
 	Line           ui.Color // borders, rules and quote bars
 	// Code colors the classes of highlighted code, by class; a class left
 	// transparent is drawn in Text.
-	Code   [MarkdownCodeClasses]ui.Color
-	Radius float32 // corners of code blocks and tables
+	Code      [MarkdownCodeClasses]ui.Color
+	Selection ui.Color // behind selected text; transparent paints none
+	Radius    float32  // corners of code blocks and tables
 }
 
 // MarkdownLookFor derives a look from a theme.
 func MarkdownLookFor(theme ui.Theme) MarkdownLook {
+	selection := theme.Primary
+	selection.Alpha *= 0.50
 	return MarkdownLook{
 		Text: theme.Foreground, Muted: theme.MutedForeground, Link: theme.Chart[1],
 		CodeFill: theme.Muted, InlineCodeFill: theme.Muted, Line: theme.Border,
-		Radius: theme.Metrics.RadiusControl,
+		Selection: selection, Radius: theme.Metrics.RadiusControl,
 	}
+}
+
+// MarkdownSelection is a range of the rendered text of a MarkdownView, in byte
+// offsets. Anchor is where the user began and Focus is where the pointer is now;
+// either may be ahead of the other. Range clamps and orders them against the
+// view's text length, so a selection that was made before a message changed
+// still copies the part that is there.
+type MarkdownSelection struct {
+	Anchor, Focus int
+}
+
+// Range returns the selected bytes, ordered and clamped to [0, textLen].
+func (s MarkdownSelection) Range(textLen int) (start, end int) {
+	start, end = s.Anchor, s.Focus
+	if start > end {
+		start, end = end, start
+	}
+	start = min(max(start, 0), textLen)
+	end = min(max(end, 0), textLen)
+	return start, end
 }
 
 // MarkdownCode is a fenced code block of a laid-out document: where it is, so
@@ -104,6 +126,8 @@ type MarkdownPaint struct {
 	// painted in one frame can share a scope: give each the total of the
 	// LinkCount of the views before it.
 	Base int
+	// Selection is highlighted behind its text. The zero range paints nothing.
+	Selection MarkdownSelection
 }
 
 // MarkdownView lays out and paints a markdown.Document. It keeps the arrays it
@@ -119,25 +143,171 @@ type MarkdownPaint struct {
 // Layout measures text and is the expensive half: do it when the text or the
 // width changed, and call Paint every frame. Proportional text has no italic
 // face yet, so emphasis is drawn a weight heavier than the text around it.
+var _ ui.TextPlacement = (*MarkdownView)(nil)
+
 type MarkdownView struct {
-	pieces  []mdPiece
-	runs    []mdCodeRun
-	hl      []MarkdownCodeRun
-	scratch []ui.TextRun
-	cell    float32 // the width of a cell of code
-	boxes   []mdBox
-	links   []mdLink
-	codes   []MarkdownCode
-	atoms   []mdAtom
-	numbers []byte
-	tabs    []byte // code lines with their tabs spread into blanks
-	bars    [markdownMaxQuote + 1]int32
-	face    ui.MonoFace
-	height  float32
+	pieces     []mdPiece
+	runs       []mdCodeRun
+	hl         []MarkdownCodeRun
+	scratch    []ui.TextRun
+	selScratch []ui.TextSpan
+	cell       float32 // the width of a cell of code
+	boxes      []mdBox
+	links      []mdLink
+	codes      []MarkdownCode
+	atoms      []mdAtom
+	numbers    []byte
+	tabs       []byte  // code lines with their tabs spread into blanks
+	tabBound   []int32 // where each byte of a spread code line came from
+	plain      []byte  // the rendered text, for selection and copying
+	spanBase   []int32 // where each span of the current inline block starts in plain
+	measure    *ui.Canvas
+	paintX     float32 // where the last Paint put the document
+	paintY     float32
+	painted    bool
+	bars       [markdownMaxQuote + 1]int32
+	face       ui.MonoFace
+	height     float32
 }
 
 // Height is the height of the laid-out document.
 func (v *MarkdownView) Height() float32 { return v.height }
+
+// TextLen is the length in bytes of the rendered text that can be selected.
+func (v *MarkdownView) TextLen() int { return len(v.plain) }
+
+// SelectedText returns the rendered text of sel: what a copy of the selection
+// puts on the clipboard. Offsets are clamped to the laid-out text, so an empty
+// view or a selection outside it returns "".
+func (v *MarkdownView) SelectedText(sel MarkdownSelection) string {
+	start, end := sel.Range(len(v.plain))
+	return string(v.plain[start:end])
+}
+
+// OffsetAt is the text offset nearest a window point, for a pointer that selects
+// answer text. It uses the origin and measurements of the last Paint, so it is
+// valid from that paint until the next Layout or Paint. Decoration such as list
+// markers is skipped; a point in the margin snaps to the nearest character.
+func (v *MarkdownView) OffsetAt(point ui.Point) (offset int, ok bool) {
+	if !v.painted || v.measure == nil || len(v.pieces) == 0 {
+		return 0, false
+	}
+	x, y := point.X-v.paintX, point.Y-v.paintY
+	best, bestScore := -1, float32(0)
+	for index := range v.pieces {
+		piece := &v.pieces[index]
+		if piece.plainLo < 0 {
+			continue
+		}
+		dx, dy := float32(0), float32(0)
+		if x < piece.x {
+			dx = piece.x - x
+		} else if x > piece.x+piece.w {
+			dx = x - piece.x - piece.w
+		}
+		if y < piece.y {
+			dy = piece.y - y
+		} else if y > piece.y+piece.h {
+			dy = y - piece.y - piece.h
+		}
+		score := dy*1_000_000 + dx
+		if best < 0 || score < bestScore {
+			best, bestScore = index, score
+		}
+	}
+	if best < 0 {
+		return 0, false
+	}
+	piece := &v.pieces[best]
+	localX := min(max(x-piece.x, 0), piece.w)
+	var local int
+	if piece.mono {
+		local = v.codeOffsetAt(piece, localX)
+	} else {
+		local = v.measure.TextOffsetAt(piece.text, piece.size, piece.weight, localX)
+	}
+	local = min(max(local, 0), int(piece.plainHi-piece.plainLo))
+	return int(piece.plainLo) + local, true
+}
+
+// CaretBounds reports no caret: a MarkdownView paints text, not an input field.
+func (v *MarkdownView) CaretBounds() (ui.Rect, bool) { return ui.Rect{}, false }
+
+// codeOffsetAt is the source byte offset nearest x inside a fixed-pitch piece.
+// Tabs are one byte in the source but several cells on screen; a point inside
+// one snaps to the nearer edge of the tab, never to a synthetic byte.
+func (v *MarkdownView) codeOffsetAt(piece *mdPiece, x float32) int {
+	source := v.plain[piece.plainLo:piece.plainHi]
+	if len(source) == 0 || x <= 0 {
+		return 0
+	}
+	if x >= piece.w {
+		return len(source)
+	}
+	cell := v.cell
+	if cell <= 0 {
+		cell = 1
+	}
+	column := int(piece.codeCol)
+	at, display := 0, float32(0)
+	for at < len(source) {
+		r, n := utf8.DecodeRune(source[at:])
+		cells := monoRuneCells(r)
+		if r == '\t' {
+			cells = 4 - column%4
+		}
+		end := display + float32(cells)*cell
+		if x < end {
+			if x-display < end-x {
+				return at
+			}
+			return at + n
+		}
+		display, column, at = end, column+cells, at+n
+	}
+	return len(source)
+}
+
+// codeDisplayRange maps byte offsets of a fixed-pitch piece's source range to
+// the bytes of its painted text, where tabs are already spaces. A tab is whole
+// in one piece, so a source range that touches it covers all of its cells.
+func (v *MarkdownView) codeDisplayRange(piece *mdPiece, start, end int) (int, int) {
+	source := v.plain[piece.plainLo:piece.plainHi]
+	from, to := -1, -1
+	if start == 0 {
+		from = 0
+	}
+	if end == 0 {
+		to = 0
+	}
+	column, display, at := int(piece.codeCol), 0, 0
+	for at < len(source) {
+		if from < 0 && at >= start {
+			from = display
+		}
+		if to < 0 && at >= end {
+			to = display
+			break
+		}
+		r, n := utf8.DecodeRune(source[at:])
+		if r == '\t' {
+			fill := 4 - column%4
+			display += fill
+			column += fill
+		} else {
+			display += n
+			column += monoRuneCells(r)
+		}
+		at += n
+	}
+	if from < 0 {
+		from = display
+	}
+	if to < 0 {
+		to = display
+	}
+	return from, to
+}
 
 // Codes lists the fenced code blocks, in reading order.
 func (v *MarkdownView) Codes() []MarkdownCode { return v.codes }
@@ -183,14 +353,20 @@ type mdCodeRun struct {
 
 type mdPiece struct {
 	runLo, runHi int32 // the stretches of a highlighted line of code, in View.runs
-	text         string
-	x, y, w, h   float32
-	size         float32
-	weight       float32
-	color        mdColor
-	mono         bool
-	strike       bool
-	link         int32
+	// plainLo and plainHi are the bytes of View.plain this piece draws, or -1
+	// when it is decoration (a list marker) that is not part of the copied text.
+	plainLo, plainHi int32
+	// codeCol is where a fixed-pitch piece starts in the cells of its source
+	// line, needed to expand the tabs in its plain range for painting.
+	codeCol    int32
+	text       string
+	x, y, w, h float32
+	size       float32
+	weight     float32
+	color      mdColor
+	mono       bool
+	strike     bool
+	link       int32
 }
 
 type mdBoxKind uint8
@@ -244,9 +420,11 @@ func (v *MarkdownView) Layout(canvas *ui.Canvas, style MarkdownStyle, doc *markd
 	if style.LineHeight <= 0 {
 		style.LineHeight = float32(int(style.Size*1.55 + 0.5))
 	}
-	v.pieces, v.boxes, v.links, v.codes, v.numbers, v.runs, v.tabs = v.pieces[:0], v.boxes[:0], v.links[:0], v.codes[:0], v.numbers[:0], v.runs[:0], v.tabs[:0]
+	v.pieces, v.boxes, v.links, v.codes, v.numbers, v.runs, v.tabs, v.tabBound, v.plain, v.spanBase = v.pieces[:0], v.boxes[:0], v.links[:0], v.codes[:0], v.numbers[:0], v.runs[:0], v.tabs[:0], v.tabBound[:0], v.plain[:0], v.spanBase[:0]
 	v.bars = [markdownMaxQuote + 1]int32{}
 	v.face = style.MonoFace
+	v.measure = canvas
+	v.painted = false
 	l := mdLayout{v: v, canvas: canvas, style: style, doc: doc}
 	width = max(width, 40)
 
@@ -266,18 +444,22 @@ func (v *MarkdownView) Layout(canvas *ui.Canvas, style MarkdownStyle, doc *markd
 		if b.Quote > 0 {
 			t.color = mdColMuted
 		}
+		l.blockBreak()
 		switch b.Kind {
 		case markdown.Paragraph:
 			indent := float32(0)
 			if b.Level > 0 {
 				indent = float32(b.Level-1)*markdownListStep + markdownMarkerW
 			}
+			l.appendSpans(doc.Spans(b))
 			y = l.inline(doc.Spans(b), x0+indent, w-indent, y, t, markdown.AlignLeft)
 		case markdown.Heading:
+			l.appendSpans(doc.Spans(b))
 			y = l.inline(doc.Spans(b), x0, w, y, l.heading(b.Level, t), markdown.AlignLeft)
 		case markdown.Item:
 			indent := float32(b.Level)*markdownListStep + markdownMarkerW
 			l.marker(b, x0+float32(b.Level)*markdownListStep, y, t)
+			l.appendSpans(doc.Spans(b))
 			y = l.inline(doc.Spans(b), x0+indent, w-indent, y, t, markdown.AlignLeft)
 			y = max(y, top+t.line)
 		case markdown.Code:
@@ -312,6 +494,29 @@ func (l *mdLayout) heading(level int, t mdFont) mdFont {
 		t.weight = ui.WeightBold
 	}
 	return t
+}
+
+// blockBreak separates the text of two blocks with one newline, however much
+// space the layout puts between them. A soft wrap adds nothing: it is not in the
+// source the user is copying.
+func (l *mdLayout) blockBreak() {
+	v := l.v
+	if len(v.plain) == 0 || v.plain[len(v.plain)-1] == '\n' {
+		return
+	}
+	v.plain = append(v.plain, '\n')
+}
+
+// appendSpans adds the visible text of an inline block to the rendered plain
+// text and records where each span starts, so every piece laid out from it can
+// say which bytes it draws.
+func (l *mdLayout) appendSpans(spans []markdown.Span) {
+	v := l.v
+	v.spanBase = v.spanBase[:0]
+	for _, sp := range spans {
+		v.spanBase = append(v.spanBase, int32(len(v.plain)))
+		v.plain = append(v.plain, sp.Text...)
+	}
 }
 
 // gap is the space between two blocks.
@@ -361,6 +566,7 @@ func (l *mdLayout) marker(b *markdown.Block, x, y float32, t mdFont) {
 	}
 	w := l.canvas.TextWidthWeight(text, t.size, ui.WeightRegular)
 	v.pieces = append(v.pieces, mdPiece{
+		plainLo: -1, plainHi: -1,
 		text: text, x: x + markdownMarkerW - 6 - w, y: y, w: w + 2, h: t.line, size: t.size,
 		weight: ui.WeightRegular, color: mdColMuted, link: -1,
 	})
@@ -379,35 +585,45 @@ func (l *mdLayout) code(b *markdown.Block, x, width, y float32) float32 {
 	top := y
 	y += markdownCodePadY
 	text := b.Text
-	for {
-		line, rest, more := cutLine(text)
-		line = v.spreadTabs(line)
+	for lineIndex := 0; ; lineIndex++ {
+		source, rest, more := cutLine(text)
+		if lineIndex > 0 {
+			v.plain = append(v.plain, '\n')
+		}
+		line, bound := v.spreadTabs(source)
 		var marked []MarkdownCodeRun
 		if style.Highlight != nil && len(line) <= 4000 {
 			v.hl = style.Highlight(b.Info, line, v.hl[:0])
 			marked = v.hl
 		}
+		column := 0
 		for start := 0; ; {
 			if l.lines >= markdownMaxLines {
 				more = false
 				break
 			}
 			end, done := monoBreak(line[start:], cols)
-			if end > 0 {
-				chunk := line[start : start+end]
+			end += start
+			end = codeBreak(line, bound, start, end)
+			if end > start {
+				chunk := line[start:end]
+				plainLo := int32(len(v.plain))
+				v.plain = append(v.plain, source[bound[start]:bound[end]]...)
 				piece := mdPiece{
+					plainLo: plainLo, plainHi: int32(len(v.plain)), codeCol: int32(column),
 					text: chunk, x: x + markdownCodePadX, y: y, w: float32(monoCells(chunk)) * cell, h: height,
 					size: size, weight: ui.WeightRegular, color: mdColText, mono: true, link: -1,
 				}
 				piece.runLo = int32(len(v.runs))
-				v.appendCodeRuns(line, start, start+end, marked)
+				v.appendCodeRuns(line, start, end, marked)
 				piece.runHi = int32(len(v.runs))
 				v.pieces = append(v.pieces, piece)
+				column += monoCells(chunk)
 			}
 			l.lines++
 			y += height
-			start += end
-			if done {
+			start = end
+			if done || start >= len(line) {
 				break
 			}
 		}
@@ -424,25 +640,75 @@ func (l *mdLayout) code(b *markdown.Block, x, width, y float32) float32 {
 }
 
 // spreadTabs returns line with each tab replaced by the blanks that reach the
-// next stop four cells on, since a fixed-pitch grid has no tab character.
-func (v *MarkdownView) spreadTabs(line string) string {
-	if strings.IndexByte(line, '\t') < 0 {
-		return line
-	}
-	start := len(v.tabs)
+// next stop four cells on, since a fixed-pitch grid has no tab character. bound
+// maps every byte boundary of the result to a byte offset of line: a boundary
+// inside a spread tab belongs to the tab, and the boundary after it belongs to
+// the byte after the tab. A line without tabs returns itself and a linear bound.
+func (v *MarkdownView) spreadTabs(line string) (string, []int32) {
+	start, boundStart := len(v.tabs), len(v.tabBound)
+	v.tabBound = append(v.tabBound, 0)
 	cells := 0
-	for _, r := range line {
+	for index := 0; index < len(line); {
+		r, n := utf8.DecodeRuneInString(line[index:])
 		if r == '\t' {
-			for fill := 4 - cells%4; fill > 0; fill-- {
+			fill := 4 - cells%4
+			for i := 0; i < fill; i++ {
 				v.tabs = append(v.tabs, ' ')
 				cells++
+				at := int32(index)
+				if i == fill-1 {
+					at = int32(index + n)
+				}
+				v.tabBound = append(v.tabBound, at)
 			}
+			index += n
 			continue
 		}
 		v.tabs = utf8.AppendRune(v.tabs, r)
 		cells += monoRuneCells(r)
+		for i := 1; i <= n; i++ {
+			v.tabBound = append(v.tabBound, int32(index+i))
+		}
+		index += n
 	}
-	return unsafe.String(&v.tabs[start], len(v.tabs)-start)
+	return unsafe.String(&v.tabs[start], len(v.tabs)-start), v.tabBound[boundStart:]
+}
+
+// codeBreak moves a chunk boundary that fell inside a spread tab out of it, so
+// every piece owns whole tabs. A tab that starts the chunk is kept whole; one
+// that starts later moves to the next chunk.
+func codeBreak(line string, bound []int32, start, end int) int {
+	if end <= start || end >= len(line) {
+		return end
+	}
+	tabStart, tabEnd, inside := tabRun(bound, end)
+	if !inside {
+		return end
+	}
+	if tabStart > start {
+		return tabStart
+	}
+	if tabEnd > start {
+		return tabEnd
+	}
+	return end
+}
+
+// tabRun is the run of boundaries in bound that name the same tab, and whether
+// at is strictly inside it. The boundary at a tab's start is not inside.
+func tabRun(bound []int32, at int) (start, end int, inside bool) {
+	if at <= 0 || at >= len(bound) {
+		return at, at, false
+	}
+	source := bound[at]
+	start, end = at, at
+	for start > 0 && bound[start-1] == source {
+		start--
+	}
+	for end < len(bound) && bound[end] == source {
+		end++
+	}
+	return start, end, start < at && at < end
 }
 
 // appendCodeRuns records the stretches of line[from:to] that marked colors, and
@@ -594,6 +860,9 @@ func (l *mdLayout) table(b *markdown.Block, x, width, y float32, t mdFont) float
 			rows = r
 			break
 		}
+		if r > 0 && len(v.plain) > 0 && v.plain[len(v.plain)-1] != '\n' {
+			v.plain = append(v.plain, '\n')
+		}
 		rowTop := y
 		rowBottom := y + 2*markdownCellPadY + t.line
 		cx := x
@@ -603,6 +872,10 @@ func (l *mdLayout) table(b *markdown.Block, x, width, y float32, t mdFont) float
 			if r == 0 {
 				style = head
 			}
+			if c > 0 {
+				v.plain = append(v.plain, ' ')
+			}
+			l.appendSpans(doc.CellSpans(cell))
 			end := l.inline(doc.CellSpans(cell), cx+markdownCellPadX, widths[c]-2*markdownCellPadX, rowTop+markdownCellPadY, style, cell.Align)
 			rowBottom = max(rowBottom, end+markdownCellPadY)
 			cx += widths[c]
@@ -847,9 +1120,11 @@ func (m *mdLine) place(a mdAtom) {
 	if a.hi <= a.lo {
 		return
 	}
+	base := v.spanBase[a.span]
 	if m.piece >= 0 && m.span == a.span {
 		p := &v.pieces[m.piece]
 		p.text = sp.Text[m.lo:a.hi]
+		p.plainHi = base + int32(a.hi)
 		p.w = m.x + a.w - (p.x - m.x0)
 	} else {
 		m.closePiece()
@@ -862,6 +1137,7 @@ func (m *mdLine) place(a mdAtom) {
 			color = mdColLink
 		}
 		v.pieces = append(v.pieces, mdPiece{
+			plainLo: base + int32(a.lo), plainHi: base + int32(a.hi),
 			text: sp.Text[a.lo:a.hi], x: m.x0 + m.x, y: m.y, w: a.w, h: m.t.line,
 			size: size, weight: weight, color: color, mono: mono, strike: sp.Style&markdown.Strike != 0, link: -1,
 		})
@@ -932,6 +1208,7 @@ func (m *mdLine) endLine() {
 
 // Paint draws the laid-out document.
 func (v *MarkdownView) Paint(canvas *ui.Canvas, p MarkdownPaint) {
+	v.paintX, v.paintY, v.painted = p.X, p.Y, true
 	look := p.Look
 	clipped := p.Clip.Height > 0
 	visible := func(y, h float32) bool {
@@ -953,6 +1230,33 @@ func (v *MarkdownView) Paint(canvas *ui.Canvas, p MarkdownPaint) {
 			canvas.Fill(rect, look.Line)
 		case mdBoxHead:
 			canvas.Rounded(rect, 4, look.InlineCodeFill)
+		}
+	}
+	start, end := p.Selection.Range(len(v.plain))
+	if start < end && look.Selection.Alpha > 0 {
+		for index := range v.pieces {
+			piece := &v.pieces[index]
+			if piece.plainLo < 0 {
+				continue
+			}
+			lo, hi := max(int(piece.plainLo), start), min(int(piece.plainHi), end)
+			if lo >= hi || !visible(p.Y+piece.y, piece.h) {
+				continue
+			}
+			if piece.mono {
+				from, to := v.codeDisplayRange(piece, lo-int(piece.plainLo), hi-int(piece.plainLo))
+				if to > from {
+					x := p.X + piece.x + float32(monoCells(piece.text[:from]))*v.cell
+					width := float32(monoCells(piece.text[from:to])) * v.cell
+					canvas.Fill(ui.Rect{X: x, Y: p.Y + piece.y, Width: width, Height: piece.h}, look.Selection)
+				}
+				continue
+			}
+			v.selScratch = canvas.TextSelection(v.selScratch[:0], piece.text, piece.size, piece.weight,
+				lo-int(piece.plainLo), hi-int(piece.plainLo))
+			for _, span := range v.selScratch {
+				canvas.Fill(ui.Rect{X: p.X + piece.x + span.X, Y: p.Y + piece.y, Width: span.Width, Height: piece.h}, look.Selection)
+			}
 		}
 	}
 	for index := range v.pieces {

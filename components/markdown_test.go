@@ -38,6 +38,384 @@ func (v *MarkdownView) words() string {
 	return out.String()
 }
 
+func TestMarkdownSelectionRangeClampsAndOrders(t *testing.T) {
+	tests := []struct {
+		name    string
+		sel     MarkdownSelection
+		textLen int
+		start   int
+		end     int
+	}{
+		{name: "empty", sel: MarkdownSelection{Anchor: 4, Focus: 4}, textLen: 10, start: 4, end: 4},
+		{name: "forward", sel: MarkdownSelection{Anchor: 2, Focus: 7}, textLen: 10, start: 2, end: 7},
+		{name: "reversed", sel: MarkdownSelection{Anchor: 7, Focus: 2}, textLen: 10, start: 2, end: 7},
+		{name: "negative", sel: MarkdownSelection{Anchor: -3, Focus: 4}, textLen: 10, start: 0, end: 4},
+		{name: "past the end", sel: MarkdownSelection{Anchor: 4, Focus: 99}, textLen: 10, start: 4, end: 10},
+		{name: "outside both ways", sel: MarkdownSelection{Anchor: -8, Focus: 99}, textLen: 10, start: 0, end: 10},
+		{name: "empty text", sel: MarkdownSelection{Anchor: -1, Focus: 3}, textLen: 0, start: 0, end: 0},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			start, end := test.sel.Range(test.textLen)
+			if start != test.start || end != test.end {
+				t.Fatalf("Range(%d) = %d..%d, want %d..%d", test.textLen, start, end, test.start, test.end)
+			}
+		})
+	}
+}
+
+func TestEmptyMarkdownViewHasNoTextToSelect(t *testing.T) {
+	var view MarkdownView
+	if got := view.TextLen(); got != 0 {
+		t.Fatalf("TextLen = %d, want 0", got)
+	}
+	if got := view.SelectedText(MarkdownSelection{Anchor: -2, Focus: 5}); got != "" {
+		t.Fatalf("SelectedText = %q, want empty", got)
+	}
+}
+
+func TestMarkdownSelectionUsesRenderedTextWithoutSoftWraps(t *testing.T) {
+	view, _ := layoutMarkdown(t, "alpha beta gamma delta epsilon", 70, MarkdownStyle{Size: 12})
+	if len(view.pieces) < 2 {
+		t.Fatalf("the paragraph did not wrap: %+v", view.pieces)
+	}
+	const want = "alpha beta gamma delta epsilon"
+	if got := view.SelectedText(MarkdownSelection{Anchor: 0, Focus: view.TextLen()}); got != want {
+		t.Fatalf("selected %q, want %q", got, want)
+	}
+	if got := view.SelectedText(MarkdownSelection{Anchor: 11, Focus: 16}); got != "gamma" {
+		t.Fatalf("selected %q, want gamma", got)
+	}
+}
+
+func TestMarkdownSelectionHasOneBreakBetweenBlocks(t *testing.T) {
+	view, _ := layoutMarkdown(t, "first paragraph\n\nsecond paragraph", 200, MarkdownStyle{Size: 12})
+	const want = "first paragraph\nsecond paragraph"
+	if got := view.SelectedText(MarkdownSelection{Anchor: 0, Focus: view.TextLen()}); got != want {
+		t.Fatalf("selected %q, want %q", got, want)
+	}
+}
+
+func TestMarkdownSelectionUsesVisibleInlineTextAndSpacing(t *testing.T) {
+	src := "before **bold** and `code` and a [link](https://example.com/x) after"
+	view, _ := layoutMarkdown(t, src, 200, MarkdownStyle{Size: 12})
+	const want = "before bold and code and a link after"
+	if got := view.SelectedText(MarkdownSelection{Anchor: 0, Focus: view.TextLen()}); got != want {
+		t.Fatalf("selected %q, want %q", got, want)
+	}
+}
+
+func TestMarkdownSelectionReadsTableCellsInRenderedOrder(t *testing.T) {
+	src := "| Name | Value |\n|:--|--:|\n| ssh | shell |\n| ftp | old |\n"
+	view, _ := layoutMarkdown(t, src, 300, MarkdownStyle{Size: 12})
+	const want = "Name Value\nssh shell\nftp old"
+	if got := view.SelectedText(MarkdownSelection{Anchor: 0, Focus: view.TextLen()}); got != want {
+		t.Fatalf("selected %q, want %q", got, want)
+	}
+}
+
+func TestInlinePiecesMapToOneRangeOfTheRenderedText(t *testing.T) {
+	view, _ := layoutMarkdown(t, "before **bold** and `code` and a [link](https://example.com/x) after", 90, MarkdownStyle{Size: 12})
+	var last int32 = -1
+	for _, piece := range view.pieces {
+		if piece.plainLo < 0 {
+			continue
+		}
+		if piece.plainLo < last || piece.plainHi < piece.plainLo || int(piece.plainHi) > view.TextLen() {
+			t.Fatalf("piece %q has range %d..%d after %d", piece.text, piece.plainLo, piece.plainHi, last)
+		}
+		if got := string(view.plain[piece.plainLo:piece.plainHi]); got != piece.text {
+			t.Errorf("piece %q maps to %q", piece.text, got)
+		}
+		last = piece.plainHi
+	}
+}
+
+func TestFencedCodeCopiesSourceLinesWithoutVisualWraps(t *testing.T) {
+	const line = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	view, _ := layoutMarkdown(t, "```\n"+line+"\nsecond line\n```\n", 200, MarkdownStyle{Size: 12})
+	var mono int
+	for _, piece := range view.pieces {
+		if piece.mono {
+			mono++
+		}
+	}
+	if mono < 3 {
+		t.Fatalf("the long code line did not wrap: %d pieces", mono)
+	}
+	want := line + "\nsecond line"
+	if got := view.SelectedText(MarkdownSelection{Anchor: 0, Focus: view.TextLen()}); got != want {
+		t.Fatalf("selected %q, want %q", got, want)
+	}
+}
+
+func TestFencedCodeKeepsTabsAndCopiesThem(t *testing.T) {
+	view, _ := layoutMarkdown(t, "```\n\tfoo\tbar\n```\n", 300, MarkdownStyle{Size: 12})
+	const want = "\tfoo\tbar"
+	if got := view.SelectedText(MarkdownSelection{Anchor: 0, Focus: view.TextLen()}); got != want {
+		t.Fatalf("selected %q, want %q", got, want)
+	}
+	tests := []struct {
+		start, end int
+		want       string
+	}{
+		{start: 0, end: 1, want: "\t"},
+		{start: 1, end: 4, want: "foo"},
+		{start: 0, end: 4, want: "\tfoo"},
+		{start: 4, end: 5, want: "\t"},
+		{start: 5, end: 8, want: "bar"},
+	}
+	for _, test := range tests {
+		if got := view.SelectedText(MarkdownSelection{Anchor: test.start, Focus: test.end}); got != test.want {
+			t.Errorf("select %d..%d = %q, want %q", test.start, test.end, got, test.want)
+		}
+	}
+}
+
+func TestCodeChunkBoundariesDoNotSplitATab(t *testing.T) {
+	// Five cells put the tab across the six-cell boundary: the first chunk has
+	// to end before it, and the next one owns the whole tab.
+	view, _ := layoutMarkdown(t, "```\nabcde\tX\n```\n", 56, MarkdownStyle{Size: 12})
+	const want = "abcde\tX"
+	if got := view.SelectedText(MarkdownSelection{Anchor: 0, Focus: view.TextLen()}); got != want {
+		t.Fatalf("selected %q, want %q", got, want)
+	}
+	last := int32(0)
+	for _, piece := range view.pieces {
+		if !piece.mono {
+			continue
+		}
+		if piece.plainLo != last || piece.plainHi <= piece.plainLo {
+			t.Fatalf("piece %q has range %d..%d, want it to start at %d", piece.text, piece.plainLo, piece.plainHi, last)
+		}
+		last = piece.plainHi
+	}
+	if int(last) != view.TextLen() {
+		t.Fatalf("code pieces cover %d bytes of %d", last, view.TextLen())
+	}
+}
+
+func TestWrappedCodePiecesCoverTheSourceLineInOrder(t *testing.T) {
+	const line = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	view, _ := layoutMarkdown(t, "```\n"+line+"\n```\n", 200, MarkdownStyle{Size: 12})
+	last := int32(0)
+	for _, piece := range view.pieces {
+		if !piece.mono {
+			continue
+		}
+		if piece.plainLo != last || piece.plainHi <= piece.plainLo {
+			t.Fatalf("piece %q has range %d..%d, want it to start at %d", piece.text, piece.plainLo, piece.plainHi, last)
+		}
+		last = piece.plainHi
+	}
+	if int(last) != view.TextLen() {
+		t.Fatalf("code pieces cover %d bytes of %d", last, view.TextLen())
+	}
+}
+
+func paintedMarkdown(t *testing.T, src string, width float32) (*MarkdownView, *ui.Canvas) {
+	t.Helper()
+	canvas := markdownCanvas()
+	var doc markdown.Document
+	doc.Parse(src)
+	var view MarkdownView
+	view.Layout(canvas, MarkdownStyle{Size: 12}, &doc, width)
+	view.Paint(canvas, MarkdownPaint{X: 10, Y: 20})
+	return &view, canvas
+}
+
+func TestMarkdownOffsetAtFollowsThePaintedText(t *testing.T) {
+	view, _ := paintedMarkdown(t, "abc def", 300)
+	tests := []struct {
+		point  ui.Point
+		offset int
+	}{
+		{point: ui.Point{X: 10, Y: 20}, offset: 0},
+		{point: ui.Point{X: 52, Y: 20}, offset: 7},
+		{point: ui.Point{X: 0, Y: 20}, offset: 0},
+		{point: ui.Point{X: 300, Y: 20}, offset: 7},
+		{point: ui.Point{X: 10, Y: -100}, offset: 0},
+		{point: ui.Point{X: 60, Y: 200}, offset: 7},
+	}
+	for _, test := range tests {
+		offset, ok := view.OffsetAt(test.point)
+		if !ok || offset != test.offset {
+			t.Errorf("OffsetAt(%v) = %d, %v, want %d", test.point, offset, ok, test.offset)
+		}
+	}
+}
+
+func TestMarkdownOffsetAtSeparatesVisualLines(t *testing.T) {
+	view, _ := paintedMarkdown(t, "first\nsecond", 300)
+	if len(view.pieces) < 2 {
+		t.Fatalf("the line break made %d pieces", len(view.pieces))
+	}
+	first, second := view.pieces[0], view.pieces[1]
+	endOfFirst, ok := view.OffsetAt(ui.Point{X: 10 + first.x + first.w, Y: 20 + first.y})
+	if !ok || endOfFirst != 5 {
+		t.Fatalf("end of the first line = %d, %v", endOfFirst, ok)
+	}
+	startOfSecond, ok := view.OffsetAt(ui.Point{X: 10 + second.x, Y: 20 + second.y + 2})
+	if !ok || startOfSecond != 6 {
+		t.Fatalf("start of the second line = %d, %v", startOfSecond, ok)
+	}
+}
+
+func TestMarkdownOffsetAtStaysOnCharacterBoundaries(t *testing.T) {
+	view, _ := paintedMarkdown(t, "中文", 300)
+	allowed := map[int]bool{0: true, 3: true, 6: true}
+	for x := float32(0); x <= 12; x++ {
+		offset, ok := view.OffsetAt(ui.Point{X: 10 + x, Y: 20})
+		if !ok || !allowed[offset] {
+			t.Fatalf("x=%v gives offset %d, not a character boundary", x, offset)
+		}
+	}
+	if offset, _ := view.OffsetAt(ui.Point{X: 16, Y: 20}); offset != 3 {
+		t.Errorf("the middle of the text gives %d, want 3", offset)
+	}
+	if offset, _ := view.OffsetAt(ui.Point{X: 22, Y: 20}); offset != 6 {
+		t.Errorf("the end of the text gives %d, want 6", offset)
+	}
+}
+
+func TestMarkdownOffsetAtSnapsInsideAnExpandedCodeTab(t *testing.T) {
+	view, _ := paintedMarkdown(t, "```\nabcde\tX\n```\n", 56)
+	var tabPiece *mdPiece
+	for index := range view.pieces {
+		if view.pieces[index].mono && view.pieces[index].plainLo == 5 {
+			tabPiece = &view.pieces[index]
+		}
+	}
+	if tabPiece == nil {
+		t.Fatalf("no piece starts at the tab: %+v", view.pieces)
+	}
+	originX, originY := float32(10+tabPiece.x), float32(20+tabPiece.y+2)
+	left, ok := view.OffsetAt(ui.Point{X: originX + 3, Y: originY})
+	if !ok || left != 5 {
+		t.Fatalf("the left half of the tab gives %d, %v, want 5", left, ok)
+	}
+	right, ok := view.OffsetAt(ui.Point{X: originX + 15, Y: originY})
+	if !ok || right != 6 {
+		t.Fatalf("the right half of the tab gives %d, %v, want 6", right, ok)
+	}
+}
+
+func TestMarkdownCaretBoundsReportsNoCaret(t *testing.T) {
+	view, _ := paintedMarkdown(t, "text", 300)
+	if bounds, ok := view.CaretBounds(); ok || bounds != (ui.Rect{}) {
+		t.Fatalf("CaretBounds = %+v, %v; a painted Markdown view has no caret", bounds, ok)
+	}
+}
+
+func markdownSelectionRects(canvas *ui.Canvas, color ui.Color) []ui.Rectangle {
+	var found []ui.Rectangle
+	for _, rectangle := range canvas.Rectangles() {
+		if rectangle.Color == color {
+			found = append(found, rectangle)
+		}
+	}
+	return found
+}
+
+func TestMarkdownPaintsPaintedSelection(t *testing.T) {
+	canvas := markdownCanvas()
+	var doc markdown.Document
+	doc.Parse("alpha beta gamma")
+	var view MarkdownView
+	view.Layout(canvas, MarkdownStyle{Size: 12}, &doc, 300)
+	selected := ui.Color{Red: 1, Alpha: 1}
+	var painted ui.Canvas
+	view.Paint(&painted, MarkdownPaint{
+		Look: MarkdownLook{Selection: selected}, X: 10, Y: 20, Selection: MarkdownSelection{Anchor: 0, Focus: 5},
+	})
+	rects := markdownSelectionRects(&painted, selected)
+	if len(rects) != 1 {
+		t.Fatalf("%d selection rectangles, want 1: %+v", len(rects), painted.Rectangles())
+	}
+	if rects[0].Bounds.Width <= 0 || rects[0].Bounds.Height <= 0 || rects[0].Bounds.Y < 20 {
+		t.Errorf("selection rectangle = %+v", rects[0].Bounds)
+	}
+	if len(painted.Texts()) == 0 {
+		t.Fatal("the text was not painted with the selection")
+	}
+}
+
+func TestMarkdownPaintsNoSelectionForAnEmptyRange(t *testing.T) {
+	canvas := markdownCanvas()
+	var doc markdown.Document
+	doc.Parse("alpha beta gamma")
+	var view MarkdownView
+	view.Layout(canvas, MarkdownStyle{Size: 12}, &doc, 300)
+	selected := ui.Color{Red: 1, Alpha: 1}
+	var painted ui.Canvas
+	view.Paint(&painted, MarkdownPaint{
+		Look: MarkdownLook{Selection: selected}, Selection: MarkdownSelection{Anchor: 4, Focus: 4},
+	})
+	if rects := markdownSelectionRects(&painted, selected); len(rects) != 0 {
+		t.Fatalf("empty selection painted %+v", rects)
+	}
+}
+
+func TestMarkdownSelectionIsClippedToVisibleLines(t *testing.T) {
+	canvas := markdownCanvas()
+	var doc markdown.Document
+	doc.Parse("first\nsecond")
+	var view MarkdownView
+	view.Layout(canvas, MarkdownStyle{Size: 12}, &doc, 300)
+	if len(view.pieces) < 2 {
+		t.Fatalf("the document has %d pieces", len(view.pieces))
+	}
+	second := view.pieces[1]
+	selected := ui.Color{Red: 1, Alpha: 1}
+	paint := func(selection MarkdownSelection) *ui.Canvas {
+		var painted ui.Canvas
+		view.Paint(&painted, MarkdownPaint{
+			Look: MarkdownLook{Selection: selected}, Selection: selection,
+			Clip: ui.Rect{Y: second.y + 2, Width: 300, Height: second.h - 2},
+		})
+		return &painted
+	}
+	if rects := markdownSelectionRects(paint(MarkdownSelection{Anchor: 0, Focus: 5}), selected); len(rects) != 0 {
+		t.Fatalf("a selection above the clip painted %+v", rects)
+	}
+	if rects := markdownSelectionRects(paint(MarkdownSelection{Anchor: 0, Focus: 12}), selected); len(rects) != 1 {
+		t.Fatalf("the visible line painted %d selection rectangles, want 1", len(rects))
+	}
+}
+
+func TestMarkdownCodeSelectionCoversATabAsCells(t *testing.T) {
+	canvas := markdownCanvas()
+	var doc markdown.Document
+	doc.Parse("```\nabcde\tX\n```\n")
+	var view MarkdownView
+	view.Layout(canvas, MarkdownStyle{Size: 12}, &doc, 56)
+	selected := ui.Color{Red: 1, Alpha: 1}
+	behind := ui.Color{Green: 1, Alpha: 1}
+	var painted ui.Canvas
+	view.Paint(&painted, MarkdownPaint{
+		Look: MarkdownLook{Selection: selected, CodeFill: behind}, Selection: MarkdownSelection{Anchor: 5, Focus: 6},
+	})
+	rects := markdownSelectionRects(&painted, selected)
+	if len(rects) != 1 {
+		t.Fatalf("%d selection rectangles, want 1: %+v", len(rects), rects)
+	}
+	selectionAt, fillAt := -1, -1
+	for index, rectangle := range painted.Rectangles() {
+		if rectangle.Color == selected {
+			selectionAt = index
+		}
+		if rectangle.Color == behind {
+			fillAt = index
+		}
+	}
+	if fillAt < 0 || selectionAt < fillAt {
+		t.Errorf("selection at %d and code fill at %d: selection must be painted over the fill", selectionAt, fillAt)
+	}
+	if want := 3 * view.cell; rects[0].Bounds.Width != want {
+		t.Errorf("the tab covers %v, want %v", rects[0].Bounds.Width, want)
+	}
+}
+
 func TestMarkdownWrapsEveryParagraphIntoItsWidthWithoutLosingText(t *testing.T) {
 	src := "A long paragraph with **bold words**, `inline code` and a [link to somewhere](https://example.com/x), 中文也要能换行，而且标点不能出现在行首。\n" +
 		"- an item that is long enough to need a second line to be shown\n" +
@@ -171,10 +549,11 @@ func TestMarkdownLayoutAndPaintDoNotAllocateOnceWarm(t *testing.T) {
 	canvas := markdownCanvas()
 	var view MarkdownView
 	look := MarkdownLookFor(ui.DarkTheme())
+	selection := MarkdownSelection{Anchor: 2, Focus: 40}
 	run := func() {
 		canvas.Reset()
 		view.Layout(canvas, MarkdownStyle{Size: 13}, &doc, 400)
-		view.Paint(canvas, MarkdownPaint{Look: look, Links: ui.Scope(3)})
+		view.Paint(canvas, MarkdownPaint{Look: look, Links: ui.Scope(3), Selection: selection})
 	}
 	run()
 	if allocs := testing.AllocsPerRun(10, run); allocs != 0 {
