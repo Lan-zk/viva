@@ -411,8 +411,15 @@ func TestMarkdownCodeSelectionCoversATabAsCells(t *testing.T) {
 	if fillAt < 0 || selectionAt < fillAt {
 		t.Errorf("selection at %d and code fill at %d: selection must be painted over the fill", selectionAt, fillAt)
 	}
-	if want := 3 * view.cell; rects[0].Bounds.Width != want {
-		t.Errorf("the tab covers %v, want %v", rects[0].Bounds.Width, want)
+	cell := float32(0)
+	for _, piece := range view.pieces {
+		if piece.mono {
+			cell = piece.cell
+			break
+		}
+	}
+	if want := 3 * cell; cell <= 0 || rects[0].Bounds.Width != want {
+		t.Errorf("the tab covers %v, want %v (cell %v)", rects[0].Bounds.Width, want, cell)
 	}
 }
 
@@ -646,5 +653,104 @@ func TestTabsInCodeBecomeBlanksSoColumnsAreTrue(t *testing.T) {
 	}
 	if codes := view.Codes(); len(codes) != 1 || !strings.Contains(codes[0].Text, "\t") {
 		t.Errorf("the copied text lost its tabs: %+v", codes)
+	}
+}
+
+func TestFencedCodeBlankLinesLayOut(t *testing.T) {
+	tests := []struct{ name, src, want string }{
+		{name: "blank line", src: "```\na\n\nb\n```\n", want: "a\n\nb"},
+		{name: "empty block", src: "```\n```\n", want: ""},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			view, _ := layoutMarkdown(t, test.src, 300, MarkdownStyle{Size: 12})
+			if got := view.SelectedText(MarkdownSelection{Anchor: 0, Focus: view.TextLen()}); got != test.want {
+				t.Fatalf("selected %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestFencedCodeToleratesInvalidUTF8(t *testing.T) {
+	view, _ := layoutMarkdown(t, "```\n\xff\n```\n", 300, MarkdownStyle{Size: 12})
+	const want = "\xff"
+	if got := view.SelectedText(MarkdownSelection{Anchor: 0, Focus: view.TextLen()}); got != want {
+		t.Fatalf("selected %q, want %q", got, want)
+	}
+}
+
+func TestInlineCodeSelectionUsesItsOwnCellWidth(t *testing.T) {
+	canvas := markdownCanvas()
+	var doc markdown.Document
+	doc.Parse("alpha `code` beta")
+	var view MarkdownView
+	view.Layout(canvas, MarkdownStyle{Size: 12}, &doc, 300)
+	selected := ui.Color{Red: 1, Alpha: 1}
+	var painted ui.Canvas
+	// "alpha " is six bytes, then the four bytes of the inline code.
+	view.Paint(&painted, MarkdownPaint{
+		Look: MarkdownLook{Selection: selected}, Selection: MarkdownSelection{Anchor: 6, Focus: 10},
+	})
+	rects := markdownSelectionRects(&painted, selected)
+	if len(rects) != 1 {
+		t.Fatalf("%d selection rectangles, want 1: %+v", len(rects), rects)
+	}
+	// Inline code is one point smaller than the body, so its cell is not a
+	// fenced block's cell and there may be no fenced block at all.
+	const cell = float32(11) / 2
+	if want := 4 * cell; rects[0].Bounds.Width != want {
+		t.Errorf("inline code selection is %v wide, want %v", rects[0].Bounds.Width, want)
+	}
+}
+
+func TestMarkdownOffsetAtInsideInlineCode(t *testing.T) {
+	view, _ := layoutMarkdown(t, "alpha `code` beta", 300, MarkdownStyle{Size: 12})
+	var painted ui.Canvas
+	view.Paint(&painted, MarkdownPaint{})
+	index := -1
+	for i := range view.pieces {
+		if view.pieces[i].mono {
+			index = i
+		}
+	}
+	if index < 0 {
+		t.Fatal("no inline code piece")
+	}
+	piece := &view.pieces[index]
+	const cell = float32(11) / 2
+	offset, ok := view.OffsetAt(ui.Point{X: piece.x + cell*2.1, Y: piece.y + 1})
+	if want := int(piece.plainLo) + 2; !ok || offset != want {
+		t.Fatalf("offset in inline code = %d, %v; want %d", offset, ok, want)
+	}
+}
+
+func TestHeadingInlineCodeSelectionUsesItsOwnCellWidth(t *testing.T) {
+	canvas := markdownCanvas()
+	var doc markdown.Document
+	doc.Parse("# alpha `code` beta\n\n```\nx\n```\n")
+	var view MarkdownView
+	view.Layout(canvas, MarkdownStyle{Size: 12}, &doc, 300)
+	index := -1
+	for i := range view.pieces {
+		if piece := &view.pieces[i]; piece.mono && !piece.spread && piece.text == "code" {
+			index = i
+		}
+	}
+	if index < 0 {
+		t.Fatal("no inline code piece in the heading")
+	}
+	piece := &view.pieces[index]
+	selected := ui.Color{Red: 1, Alpha: 1}
+	var painted ui.Canvas
+	view.Paint(&painted, MarkdownPaint{
+		Look:      MarkdownLook{Selection: selected},
+		Selection: MarkdownSelection{Anchor: int(piece.plainLo), Focus: int(piece.plainHi)},
+	})
+	rects := markdownSelectionRects(&painted, selected)
+	if len(rects) != 1 {
+		t.Fatalf("%d selection rectangles, want 1: %+v", len(rects), rects)
+	}
+	if want := float32(monoCells(piece.text)) * piece.cell; rects[0].Bounds.Width != want {
+		t.Errorf("heading inline code selection is %v wide, want %v", rects[0].Bounds.Width, want)
 	}
 }

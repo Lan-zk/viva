@@ -151,7 +151,6 @@ type MarkdownView struct {
 	hl         []MarkdownCodeRun
 	scratch    []ui.TextRun
 	selScratch []ui.TextSpan
-	cell       float32 // the width of a cell of code
 	boxes      []mdBox
 	links      []mdLink
 	codes      []MarkdownCode
@@ -234,8 +233,10 @@ func (v *MarkdownView) OffsetAt(point ui.Point) (offset int, ok bool) {
 func (v *MarkdownView) CaretBounds() (ui.Rect, bool) { return ui.Rect{}, false }
 
 // codeOffsetAt is the source byte offset nearest x inside a fixed-pitch piece.
-// Tabs are one byte in the source but several cells on screen; a point inside
-// one snaps to the nearer edge of the tab, never to a synthetic byte.
+// The piece's own cell width is used, because inline code is drawn smaller than
+// a fenced block. In a fenced piece a tab is one byte in the source but several
+// cells on screen; a point inside one snaps to the nearer edge of the tab, never
+// to a synthetic byte.
 func (v *MarkdownView) codeOffsetAt(piece *mdPiece, x float32) int {
 	source := v.plain[piece.plainLo:piece.plainHi]
 	if len(source) == 0 || x <= 0 {
@@ -244,7 +245,7 @@ func (v *MarkdownView) codeOffsetAt(piece *mdPiece, x float32) int {
 	if x >= piece.w {
 		return len(source)
 	}
-	cell := v.cell
+	cell := piece.cell
 	if cell <= 0 {
 		cell = 1
 	}
@@ -253,7 +254,7 @@ func (v *MarkdownView) codeOffsetAt(piece *mdPiece, x float32) int {
 	for at < len(source) {
 		r, n := utf8.DecodeRune(source[at:])
 		cells := monoRuneCells(r)
-		if r == '\t' {
+		if r == '\t' && piece.spread {
 			cells = 4 - column%4
 		}
 		end := display + float32(cells)*cell
@@ -357,8 +358,13 @@ type mdPiece struct {
 	// when it is decoration (a list marker) that is not part of the copied text.
 	plainLo, plainHi int32
 	// codeCol is where a fixed-pitch piece starts in the cells of its source
-	// line, needed to expand the tabs in its plain range for painting.
+	// line, needed to expand the tabs in its plain range for painting. spread
+	// marks a fenced-code piece, whose text has its tabs already expanded; the
+	// cell is that piece's own cell width, which differs between a fenced block
+	// and smaller inline code (and between body text and a heading).
 	codeCol    int32
+	cell       float32
+	spread     bool
 	text       string
 	x, y, w, h float32
 	size       float32
@@ -580,7 +586,6 @@ func (l *mdLayout) code(b *markdown.Block, x, width, y float32) float32 {
 	if cell <= 0 {
 		cell = size * 0.6
 	}
-	v.cell = cell
 	cols := max(int((width-2*markdownCodePadX-style.CodeInset)/cell), 4)
 	top := y
 	y += markdownCodePadY
@@ -610,7 +615,7 @@ func (l *mdLayout) code(b *markdown.Block, x, width, y float32) float32 {
 				plainLo := int32(len(v.plain))
 				v.plain = append(v.plain, source[bound[start]:bound[end]]...)
 				piece := mdPiece{
-					plainLo: plainLo, plainHi: int32(len(v.plain)), codeCol: int32(column),
+					plainLo: plainLo, plainHi: int32(len(v.plain)), codeCol: int32(column), cell: cell, spread: true,
 					text: chunk, x: x + markdownCodePadX, y: y, w: float32(monoCells(chunk)) * cell, h: height,
 					size: size, weight: ui.WeightRegular, color: mdColText, mono: true, link: -1,
 				}
@@ -664,6 +669,16 @@ func (v *MarkdownView) spreadTabs(line string) (string, []int32) {
 			index += n
 			continue
 		}
+		if r == utf8.RuneError && n == 1 {
+			// Invalid UTF-8: keep the source byte. AppendRune would write three
+			// bytes for it and the boundary map would no longer match the
+			// display text.
+			v.tabs = append(v.tabs, line[index])
+			cells++
+			v.tabBound = append(v.tabBound, int32(index+1))
+			index++
+			continue
+		}
 		v.tabs = utf8.AppendRune(v.tabs, r)
 		cells += monoRuneCells(r)
 		for i := 1; i <= n; i++ {
@@ -671,7 +686,13 @@ func (v *MarkdownView) spreadTabs(line string) (string, []int32) {
 		}
 		index += n
 	}
-	return unsafe.String(&v.tabs[start], len(v.tabs)-start), v.tabBound[boundStart:]
+	bound := v.tabBound[boundStart:]
+	if len(v.tabs) == start {
+		// An empty source line (a blank line inside a fence) produced no bytes;
+		// &v.tabs[start] would be one past the buffer.
+		return "", bound
+	}
+	return unsafe.String(&v.tabs[start], len(v.tabs)-start), bound
 }
 
 // codeBreak moves a chunk boundary that fell inside a spread tab out of it, so
@@ -1129,15 +1150,20 @@ func (m *mdLine) place(a mdAtom) {
 	} else {
 		m.closePiece()
 		size, weight, color := m.t.size, spanWeight(m.t.weight, sp.Style), m.t.color
+		var cell float32
 		if mono {
 			size = max(size-1, 9)
 			m.x += 2
+			cell, _ = l.canvas.MonoCellSize(size, l.style.MonoFace)
+			if cell <= 0 {
+				cell = size * 0.6
+			}
 		}
 		if sp.Link != "" {
 			color = mdColLink
 		}
 		v.pieces = append(v.pieces, mdPiece{
-			plainLo: base + int32(a.lo), plainHi: base + int32(a.hi),
+			plainLo: base + int32(a.lo), plainHi: base + int32(a.hi), cell: cell,
 			text: sp.Text[a.lo:a.hi], x: m.x0 + m.x, y: m.y, w: a.w, h: m.t.line,
 			size: size, weight: weight, color: color, mono: mono, strike: sp.Style&markdown.Strike != 0, link: -1,
 		})
@@ -1244,10 +1270,17 @@ func (v *MarkdownView) Paint(canvas *ui.Canvas, p MarkdownPaint) {
 				continue
 			}
 			if piece.mono {
-				from, to := v.codeDisplayRange(piece, lo-int(piece.plainLo), hi-int(piece.plainLo))
+				from, to := lo-int(piece.plainLo), hi-int(piece.plainLo)
+				if piece.spread {
+					from, to = v.codeDisplayRange(piece, from, to)
+				}
 				if to > from {
-					x := p.X + piece.x + float32(monoCells(piece.text[:from]))*v.cell
-					width := float32(monoCells(piece.text[from:to])) * v.cell
+					cell := piece.cell
+					if cell <= 0 {
+						cell = 1
+					}
+					x := p.X + piece.x + float32(monoCells(piece.text[:from]))*cell
+					width := float32(monoCells(piece.text[from:to])) * cell
 					canvas.Fill(ui.Rect{X: x, Y: p.Y + piece.y, Width: width, Height: piece.h}, look.Selection)
 				}
 				continue
@@ -1283,7 +1316,7 @@ func (v *MarkdownView) Paint(canvas *ui.Canvas, p MarkdownPaint) {
 				v.scratch = append(v.scratch, ui.TextRun{Column: column, Bytes: run.bytes, Cells: run.cells, Color: stretch})
 				column += run.cells
 			}
-			canvas.LabelRuns(piece.text, rect, ui.TextStyle{Size: piece.size, Color: color, Mono: true, MonoFace: v.face}, v.cell, v.scratch)
+			canvas.LabelRuns(piece.text, rect, ui.TextStyle{Size: piece.size, Color: color, Mono: true, MonoFace: v.face}, piece.cell, v.scratch)
 		} else {
 			canvas.Label(piece.text, rect, ui.TextStyle{Size: piece.size, Weight: piece.weight, Color: color, Mono: piece.mono, MonoFace: v.face})
 		}
