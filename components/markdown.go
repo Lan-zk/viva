@@ -2,6 +2,7 @@ package components
 
 import (
 	"strconv"
+	"strings"
 	"unicode/utf8"
 	"unsafe"
 
@@ -613,7 +614,11 @@ func (l *mdLayout) code(b *markdown.Block, x, width, y float32) float32 {
 			if end > start {
 				chunk := line[start:end]
 				plainLo := int32(len(v.plain))
-				v.plain = append(v.plain, source[bound[start]:bound[end]]...)
+				if bound == nil {
+					v.plain = append(v.plain, source[start:end]...)
+				} else {
+					v.plain = append(v.plain, source[bound[start]:bound[end]]...)
+				}
 				piece := mdPiece{
 					plainLo: plainLo, plainHi: int32(len(v.plain)), codeCol: int32(column), cell: cell, spread: true,
 					text: chunk, x: x + markdownCodePadX, y: y, w: float32(monoCells(chunk)) * cell, h: height,
@@ -650,6 +655,11 @@ func (l *mdLayout) code(b *markdown.Block, x, width, y float32) float32 {
 // inside a spread tab belongs to the tab, and the boundary after it belongs to
 // the byte after the tab. A line without tabs returns itself and a linear bound.
 func (v *MarkdownView) spreadTabs(line string) (string, []int32) {
+	if strings.IndexByte(line, '\t') < 0 {
+		// Nothing to spread and the display bytes are the source bytes: no
+		// boundary map is needed, so ordinary code lines pay nothing.
+		return line, nil
+	}
 	start, boundStart := len(v.tabs), len(v.tabBound)
 	v.tabBound = append(v.tabBound, 0)
 	cells := 0
@@ -699,7 +709,7 @@ func (v *MarkdownView) spreadTabs(line string) (string, []int32) {
 // every piece owns whole tabs. A tab that starts the chunk is kept whole; one
 // that starts later moves to the next chunk.
 func codeBreak(line string, bound []int32, start, end int) int {
-	if end <= start || end >= len(line) {
+	if bound == nil || end <= start || end >= len(line) {
 		return end
 	}
 	tabStart, tabEnd, inside := tabRun(bound, end)
