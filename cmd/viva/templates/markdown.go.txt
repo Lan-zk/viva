@@ -1069,6 +1069,9 @@ type mdLine struct {
 	pieceP int // first piece, box and link of the line, for alignment
 	pieceB int
 	pieceL int
+	// grew reports that the open piece took a second atom, so its width is a
+	// running sum that closePiece must settle.
+	grew bool
 	// measured* remembers candidateWidth's complete-piece measurement so that
 	// place can commit the same fragment without measuring it again.
 	measuredSpan int32
@@ -1093,6 +1096,13 @@ func (l *mdLayout) inline(spans []markdown.Span, x, width, y float32, t mdFont, 
 			m.endLine()
 			continue
 		}
+		// Most atoms sit well inside the line. They fit without consulting the
+		// shaped width, which is what keeps filling a line from costing one
+		// shaping per atom.
+		if !a.glue && a.w <= m.width && m.x+a.w <= m.width-2*m.t.size {
+			m.place(a)
+			continue
+		}
 		a, place := m.fit(a)
 		if place {
 			m.place(a)
@@ -1112,12 +1122,12 @@ func (m *mdLine) fit(a mdAtom) (mdAtom, bool) {
 	}
 	if a.glue && m.has && m.candidateWidth(a) > m.width {
 		// Closing punctuation may not start a line. Move the preceding piece
-		// with it when the pair fits; otherwise leave it hanging rather than
-		// losing the punctuation or looping on an unbreakable fragment.
-		if !m.rewindForGlue(a) {
-			if !m.splitForGlue(a) {
-				return a, true
-			}
+		// with it when the pair fits; otherwise move the shortest suffix that
+		// can carry it. When neither works, nothing on this line can hold the
+		// punctuation, so it starts the next one: painting it past the column,
+		// where the clip cuts it in silence, is worse.
+		if !m.rewindForGlue(a) && !m.splitForGlue(a) {
+			m.endLine()
 		}
 	}
 	if m.has && m.candidateWidth(a) > m.width {
@@ -1142,6 +1152,7 @@ func (m *mdLine) reset() {
 	m.x, m.w, m.has, m.piece = 0, 0, false, -1
 	m.pieceP, m.pieceB, m.pieceL = len(v.pieces), len(v.boxes), len(v.links)
 	m.measuredSpan, m.measuredLo, m.measuredHi, m.measuredEnd = -1, 0, 0, 0
+	m.grew = false
 }
 
 func (m *mdLine) spanWidth(sp markdown.Span, text string) float32 {
@@ -1174,11 +1185,20 @@ func (m *mdLine) exactWidth(a mdAtom) float32 {
 
 // candidateWidth is where atom a would end if it continued the current line.
 // A piece is remeasured as the complete string it will paint, so shaped text
-// cannot change the right edge after the line has been committed.
+// cannot change the right edge after the line has been committed. Shaping the
+// growing piece once per atom would make a line quadratic in its length, so
+// only an atom that may cross the edge is measured that way: further inside the
+// line the running width cannot decide the break.
 func (m *mdLine) candidateWidth(a mdAtom) float32 {
 	sp := m.spans[a.span]
 	if m.piece >= 0 && m.span == a.span {
 		p := &m.l.v.pieces[m.piece]
+		// Either side of the edge is decided as well by the running width; only
+		// the band around it needs the shaped one.
+		if approx := m.x + a.w; approx <= m.width-2*m.t.size || approx >= m.width+2*m.t.size {
+			m.measuredSpan = -1
+			return approx
+		}
 		end := p.x - m.x0 + m.spanWidth(sp, sp.Text[m.lo:a.hi]) + 2*p.padX
 		m.measuredSpan, m.measuredLo, m.measuredHi, m.measuredEnd = a.span, m.lo, a.hi, end
 		return end
@@ -1208,6 +1228,7 @@ func (m *mdLine) rewindForGlue(a mdAtom) bool {
 	if m.piece < 0 {
 		return false
 	}
+	m.settlePiece()
 	v := m.l.v
 	prev := v.pieces[m.piece]
 	start := prev.x - m.x0
@@ -1237,6 +1258,7 @@ func (m *mdLine) splitForGlue(a mdAtom) bool {
 	if m.piece < 0 {
 		return false
 	}
+	m.settlePiece()
 	v := m.l.v
 	prev := v.pieces[m.piece]
 	sp := m.spans[m.span]
@@ -1332,38 +1354,68 @@ func (m *mdLine) place(a mdAtom) {
 		p := &v.pieces[m.piece]
 		p.text = sp.Text[m.lo:a.hi]
 		p.plainHi = base + int32(a.hi)
-	} else {
-		m.closePiece()
-		size, weight, color := m.t.size, spanWeight(m.t.weight, sp.Style), m.t.color
-		var cell, padX float32
-		if mono {
-			size = max(size-1, 9)
-			padX = markdownInlinePad
-			cell, _ = l.canvas.MonoCellSize(size, l.style.MonoFace)
-			if cell <= 0 {
-				cell = size * 0.6
-			}
+		if m.measuredSpan == a.span && m.measuredLo == m.lo && m.measuredHi == a.hi {
+			p.w = m.measuredEnd - (p.x - m.x0)
+			m.grew = false
+		} else {
+			// Growing the open piece costs no shaping: the cursor already holds
+			// what the piece covers, so its width is that plus the atom. Only
+			// shaping that is not a sum of its atoms can move the result, and
+			// settlePiece corrects that once, when the piece stops growing.
+			p.w = m.x - (p.x - m.x0) + a.w
+			m.grew = true
 		}
-		if sp.Link != "" {
-			color = mdColLink
-		}
-		v.pieces = append(v.pieces, mdPiece{
-			plainLo: base + int32(a.lo), plainHi: base + int32(a.hi), cell: cell, padX: padX,
-			text: sp.Text[a.lo:a.hi], x: m.x0 + m.x, y: m.y, w: a.w, h: m.t.line,
-			size: size, weight: weight, color: color, mono: mono, strike: sp.Style&markdown.Strike != 0, link: -1,
-		})
-		m.piece, m.span, m.lo = len(v.pieces)-1, a.span, a.lo
+		m.x = p.x - m.x0 + p.w
+		m.w = m.x
+		m.x += a.space
+		m.has = true
+		return
 	}
+	m.closePiece()
+	size, weight, color := m.t.size, spanWeight(m.t.weight, sp.Style), m.t.color
+	var cell, padX float32
+	if mono {
+		size = max(size-1, 9)
+		padX = markdownInlinePad
+		cell, _ = l.canvas.MonoCellSize(size, l.style.MonoFace)
+		if cell <= 0 {
+			cell = size * 0.6
+		}
+	}
+	if sp.Link != "" {
+		color = mdColLink
+	}
+	v.pieces = append(v.pieces, mdPiece{
+		plainLo: base + int32(a.lo), plainHi: base + int32(a.hi), cell: cell, padX: padX,
+		text: sp.Text[a.lo:a.hi], x: m.x0 + m.x, y: m.y, w: a.w, h: m.t.line,
+		size: size, weight: weight, color: color, mono: mono, strike: sp.Style&markdown.Strike != 0, link: -1,
+	})
+	m.piece, m.span, m.lo = len(v.pieces)-1, a.span, a.lo
+	m.measuredSpan, m.grew = -1, false
 	p := &v.pieces[m.piece]
-	if m.measuredSpan == a.span && m.measuredLo == m.lo && m.measuredHi == a.hi {
-		p.w = m.measuredEnd - (p.x - m.x0)
-	} else {
-		p.w = m.spanWidth(sp, sp.Text[m.lo:a.hi]) + 2*p.padX
-	}
 	m.x = p.x - m.x0 + p.w
 	m.w = m.x
 	m.x += a.space
 	m.has = true
+}
+
+// settlePiece makes the open piece's width exact, which place leaves running
+// while the piece grows. Only the open piece is last on its line, so the
+// correction moves nothing that is already placed.
+func (m *mdLine) settlePiece() {
+	if m.piece < 0 || !m.grew {
+		return
+	}
+	v := m.l.v
+	p := &v.pieces[m.piece]
+	sp := m.spans[m.span]
+	exact := m.spanWidth(sp, p.text) + 2*p.padX
+	m.grew = false
+	if delta := exact - p.w; delta != 0 {
+		p.w = exact
+		m.x += delta
+		m.w += delta
+	}
 }
 
 // closePiece finishes the open piece: the box behind inline code, the region of a link.
@@ -1371,6 +1423,7 @@ func (m *mdLine) closePiece() {
 	if m.piece < 0 {
 		return
 	}
+	m.settlePiece()
 	v := m.l.v
 	p := &v.pieces[m.piece]
 	sp := m.spans[m.span]
