@@ -198,6 +198,31 @@ func BenchmarkDrawIconDirect(b *testing.B) {
 	}
 }
 
+// The transforming path is the one a motion runs every frame: it must not pile
+// up allocations, and it must stay close to the cached still path.
+func BenchmarkDrawIconTransformed(b *testing.B) {
+	bounds := Rect{X: 40, Y: 40, Width: 16, Height: 16}
+	tint := Color{Alpha: 1}
+	tests := []struct {
+		name      string
+		transform IconTransform
+	}{
+		{"rotate", IconTransform{Rotate: 0.4}},
+		{"reveal", IconTransform{Reveal: 0.5}},
+		{"parts", IconTransform{Parts: []IconPart{{Contour: 1, Offset: Point{Y: 2}}}}},
+	}
+	for _, test := range tests {
+		b.Run(test.name, func(b *testing.B) {
+			var canvas Canvas
+			b.ReportAllocs()
+			for b.Loop() {
+				canvas.Reset()
+				canvas.DrawIconTransformed(testStrokeIcon, bounds, tint, test.transform)
+			}
+		})
+	}
+}
+
 // The materialized cache is keyed by the canvas state its triangles carry, so a
 // paint after a rectangle, or inside a clip, must not reuse the plain one.
 func TestIconPaintCacheKeepsCanvasState(t *testing.T) {
@@ -448,6 +473,35 @@ func TestAContourAndItsGlyphCacheApart(t *testing.T) {
 	reversed.Reset()
 	reversed.DrawIcon(testStrokeIcon, bounds, tint)
 	sameTriangles(t, reversed.Triangles(), want)
+}
+
+// A glyph's filled layers are not contours, so a part that moves must not drop
+// them: they paint once, through the glyph's placement, where the whole glyph
+// paints them.
+func TestAMovingPartKeepsTheGlyphLayers(t *testing.T) {
+	bounds := Rect{X: 10, Y: 20, Width: 16, Height: 16}
+	tint := Color{Alpha: 1}
+	layersOnly := testWideIcon
+	layersOnly.Commands = nil
+	var only Canvas
+	only.DrawIcon(layersOnly, bounds, tint)
+	layers := only.Triangles()
+	if len(layers) == 0 {
+		t.Fatal("the test icon has no layers to compare against")
+	}
+
+	var moved Canvas
+	target, ok := moved.iconTarget(testWideIcon, bounds)
+	if !ok {
+		t.Fatal("the icon fits nowhere")
+	}
+	moved.drawIconParts(testWideIcon, target.Width, tint, stillPlacement(Point{X: target.X, Y: target.Y}),
+		[]IconPart{{Contour: 0, Offset: Point{Y: 2}}})
+	got := moved.Triangles()
+	if len(got) < len(layers) {
+		t.Fatalf("the moving glyph painted %d triangles, fewer than its %d layer triangles", len(got), len(layers))
+	}
+	sameTriangles(t, got[len(got)-len(layers):], layers)
 }
 
 // A reveal writes the glyph on from its right edge: the triangles are the still

@@ -126,6 +126,13 @@ type IconTransform struct {
 // IconPart moves one contour of an icon on its own. Contours are numbered in
 // drawing order from zero; Icon.Contours yields them as icons, which is how a
 // caller finds out which contour is which.
+//
+// The number is a handle on a particular drawing, not a name: regenerating a
+// glyph may insert, merge or reorder its contours, and the same index then moves
+// a different part. An index that no contour has, or a second part on the same
+// contour, is ignored rather than reported. A component that addresses contours
+// must therefore pin which one it means with a test that paints the glyph and
+// checks the part moves where it should.
 type IconPart struct {
 	// Contour is the index of the contour this part moves.
 	Contour int
@@ -168,21 +175,27 @@ func (part IconPart) stretches() bool {
 // with its own transform. Filled layer colors belong to the whole glyph and are
 // left out of the contours.
 func (icon Icon) Contours() []Icon {
-	var contours []Icon
+	return icon.appendContours(nil)
+}
+
+// appendContours is Contours into a caller's own buffer, so a paint that runs
+// every frame does not allocate the slice again. The returned slice may share
+// dst's backing array.
+func (icon Icon) appendContours(dst []Icon) []Icon {
 	start := -1
 	for index, command := range icon.Commands {
 		if command.Kind != PathCommandMove {
 			continue
 		}
 		if start >= 0 {
-			contours = append(contours, icon.contour(start, index))
+			dst = append(dst, icon.contour(start, index))
 		}
 		start = index
 	}
 	if start >= 0 {
-		contours = append(contours, icon.contour(start, len(icon.Commands)))
+		dst = append(dst, icon.contour(start, len(icon.Commands)))
 	}
-	return contours
+	return dst
 }
 
 // contour is one slice of the icon's commands drawn as an icon of its own. The

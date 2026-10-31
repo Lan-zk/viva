@@ -314,8 +314,13 @@ func (place iconPlacement) apply(point Point) Point {
 // placement composed with its own part. A contour nobody moves is drawn with the
 // glyph's placement, so the only cost of an unmoving part is that the glyph is
 // painted as several paths rather than one.
+//
+// Layers are not contours: a multi-color icon paints them once through the
+// glyph's placement, after the contours, in the order the whole glyph paints
+// them. A part that moves changes the stroked glyph only, never the layer colors.
 func (canvas *Canvas) drawIconParts(icon Icon, fit float32, tint Color, place iconPlacement, parts []IconPart) {
-	contours := icon.Contours()
+	contours := icon.appendContours(canvas.iconContours[:0])
+	canvas.iconContours = contours
 	centers := canvas.iconPartCenters[:0]
 	for index := range contours {
 		var center Point
@@ -342,6 +347,11 @@ func (canvas *Canvas) drawIconParts(icon Icon, fit float32, tint Color, place ic
 			own = local.after(place)
 		}
 		canvas.drawIconPlaced(contours[index], fit, tint, own)
+	}
+	if len(icon.Layers) > 0 {
+		layers := icon
+		layers.Commands = nil
+		canvas.drawIconPlaced(layers, fit, tint, place)
 	}
 }
 
