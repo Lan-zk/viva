@@ -760,6 +760,20 @@ func makeNativeTextLabels(labels []TextLabel) (unsafe.Pointer, []unsafe.Pointer,
 			origin_y:        C.float(label.OriginY),
 			font_generation: C.uint32_t(label.FontGeneration),
 		}
+		if label.HasQuad {
+			// The corners and their colours decide where the label's picture
+			// lands; an all-zero quad is the axis-aligned box (see native.h).
+			for at, point := range label.Quad {
+				native[validCount].quad[at*2] = C.float(point.X)
+				native[validCount].quad[at*2+1] = C.float(point.Y)
+			}
+			for at, tint := range label.Tint {
+				native[validCount].tint[at*4] = C.float(tint.Red)
+				native[validCount].tint[at*4+1] = C.float(tint.Green)
+				native[validCount].tint[at*4+2] = C.float(tint.Blue)
+				native[validCount].tint[at*4+3] = C.float(tint.Alpha)
+			}
+		}
 		validCount++
 	}
 	if validCount == 0 {

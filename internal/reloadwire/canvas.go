@@ -13,6 +13,7 @@ func CaptureCanvas(canvas *ui.Canvas) CanvasSnapshot {
 	}
 	return CanvasSnapshot{
 		Rectangles:   append([]ui.Rectangle(nil), canvas.Rectangles()...),
+		Triangles:    append([]ui.Triangle(nil), canvas.Triangles()...),
 		Shadows:      append([]ui.Shadow(nil), canvas.Shadows()...),
 		Images:       append([]ui.Image(nil), canvas.Images()...),
 		Texts:        append([]ui.Text(nil), canvas.Texts()...),
@@ -28,25 +29,42 @@ func CaptureCanvas(canvas *ui.Canvas) CanvasSnapshot {
 
 func ApplyCanvas(canvas *ui.Canvas, snapshot CanvasSnapshot) {
 	canvas.Reset()
-	// A shadow goes back among the rectangles where it was painted. Triangles are
-	// not carried, so only the rectangles count.
+	// Interleave triangles and shadows back among the rectangles in the exact
+	// paint order recorded by RectsBefore and TrianglesBefore.
+	triangles := snapshot.Triangles
+	trianglesDone := 0
 	shadows := snapshot.Shadows
-	replayShadows := func(rectangles int) {
-		for len(shadows) > 0 && int(shadows[0].RectsBefore) <= rectangles {
-			shadow := shadows[0]
-			shadows = shadows[1:]
-			pushLayerAndClip(canvas, shadow.Layer, shadow.ClipOf, shadow.HasClip)
-			canvas.Shadow(shadow.Bounds, shadow.Radius, shadow.Style, shadow.Color)
-			popLayerAndClip(canvas, shadow.Layer, shadow.HasClip)
+	replayInterleaved := func(rectangles int) {
+		for {
+			if len(shadows) > 0 &&
+				int(shadows[0].RectsBefore) <= rectangles &&
+				int(shadows[0].TrianglesBefore) <= trianglesDone {
+				shadow := shadows[0]
+				shadows = shadows[1:]
+				pushLayerAndClip(canvas, shadow.Layer, shadow.ClipOf, shadow.HasClip)
+				canvas.Shadow(shadow.Bounds, shadow.Radius, shadow.Style, shadow.Color)
+				popLayerAndClip(canvas, shadow.Layer, shadow.HasClip)
+				continue
+			}
+			if len(triangles) > 0 && int(triangles[0].RectsBefore) <= rectangles {
+				triangle := triangles[0]
+				triangles = triangles[1:]
+				trianglesDone++
+				pushLayerAndClip(canvas, triangle.Layer, triangle.ClipOf, triangle.HasClip)
+				canvas.AppendTriangle(triangle)
+				popLayerAndClip(canvas, triangle.Layer, triangle.HasClip)
+				continue
+			}
+			break
 		}
 	}
 	for index, rectangle := range snapshot.Rectangles {
-		replayShadows(index)
+		replayInterleaved(index)
 		pushLayerAndClip(canvas, rectangle.Layer, rectangle.ClipOf, rectangle.HasClip)
 		canvas.Rounded(rectangle.Bounds, rectangle.Radius, rectangle.Color)
 		popLayerAndClip(canvas, rectangle.Layer, rectangle.HasClip)
 	}
-	replayShadows(len(snapshot.Rectangles))
+	replayInterleaved(len(snapshot.Rectangles))
 	for _, image := range snapshot.Images {
 		pushLayerAndClip(canvas, image.Layer, image.ClipOf, image.HasClip)
 		canvas.DrawBitmapRegion(image.Bitmap, image.Source, image.Bounds)
@@ -56,6 +74,8 @@ func ApplyCanvas(canvas *ui.Canvas, snapshot CanvasSnapshot) {
 		pushLayerAndClip(canvas, text.Layer, text.ClipOf, text.HasClip)
 		if text.RunCount > 0 || text.CellWidth > 0 {
 			canvas.LabelRuns(text.Value, text.Bounds, text.Style, text.CellWidth, snapshot.Runs[text.RunFirst:text.RunFirst+text.RunCount])
+		} else if text.HasQuad {
+			canvas.LabelQuad(text.Value, text.Bounds, ui.Quad{Points: text.Quad, Tint: text.Tint}, text.Style)
 		} else {
 			canvas.Label(text.Value, text.Bounds, text.Style)
 		}

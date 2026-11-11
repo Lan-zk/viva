@@ -35,6 +35,21 @@ type Point struct {
 	Y float32
 }
 
+// Quad is the shape a text line or a bitmap is drawn into instead of its
+// axis-aligned bounds: four corners in the order top-left, top-right,
+// bottom-left, bottom-right, and the colour multiplied into the pixels at each
+// corner. A corner's Tint is a straight-alpha colour scaling the pixels drawn
+// there, so a quad can tilt, foreshorten, fade or shade a picture across its
+// surface. Give every corner a tint: the zero colour is transparent black.
+//
+// Text is rasterised at its Bounds size and then mapped onto the quad, so give
+// Bounds the rectangle the line occupies untransformed. Curvature inside one
+// line is not modelled; bend a page out of several quads rather than one.
+type Quad struct {
+	Points [4]Point
+	Tint   [4]Color
+}
+
 // Rectangle is one solid paint primitive. ClipOf/HasClip capture the active
 // clip intersection at paint time; renderers intersect Bounds with it.
 type Rectangle struct {
@@ -242,6 +257,11 @@ type Text struct {
 	Layer     uint16
 	ClipOf    Rect
 	HasClip   bool
+	// Quad, while HasQuad, is the shape the line is drawn into instead of
+	// Bounds: see Canvas.LabelQuad.
+	Quad    [4]Point
+	Tint    [4]Color
+	HasQuad bool
 }
 
 // Bitmap is immutable premultiplied BGRA pixel data. Pixels are stored top

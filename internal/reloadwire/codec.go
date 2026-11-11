@@ -82,6 +82,7 @@ type PaintRequest struct {
 
 type CanvasSnapshot struct {
 	Rectangles   []ui.Rectangle
+	Triangles    []ui.Triangle
 	Shadows      []ui.Shadow
 	Images       []ui.Image
 	Texts        []ui.Text
@@ -462,6 +463,22 @@ func encodeCanvas(value CanvasSnapshot) ([]byte, error) {
 		encodeRect(&result, rectangle.ClipOf)
 		result.bool(rectangle.HasClip)
 	}
+	result.u32(uint32(len(value.Triangles)))
+	for _, triangle := range value.Triangles {
+		for _, pt := range triangle.Points {
+			result.f32(pt.X)
+			result.f32(pt.Y)
+		}
+		encodeColor(&result, triangle.Color)
+		encodeColor(&result, triangle.Shade[0])
+		encodeColor(&result, triangle.Shade[1])
+		result.bool(triangle.Shaded)
+		result.u16(triangle.Layer)
+		result.u8(triangle.EdgeMask)
+		encodeRect(&result, triangle.ClipOf)
+		result.bool(triangle.HasClip)
+		result.u32(triangle.RectsBefore)
+	}
 	result.u32(uint32(len(value.Shadows)))
 	for _, shadow := range value.Shadows {
 		encodeRect(&result, shadow.Bounds)
@@ -518,6 +535,16 @@ func encodeCanvas(value CanvasSnapshot) ([]byte, error) {
 		result.u16(text.Layer)
 		encodeRect(&result, text.ClipOf)
 		result.bool(text.HasClip)
+		result.bool(text.HasQuad)
+		if text.HasQuad {
+			for _, pt := range text.Quad {
+				result.f32(pt.X)
+				result.f32(pt.Y)
+			}
+			for _, tint := range text.Tint {
+				encodeColor(&result, tint)
+			}
+		}
 	}
 	result.u32(uint32(len(value.Hits)))
 	for _, hit := range value.Hits {
@@ -563,6 +590,24 @@ func decodeCanvas(data []byte) (CanvasSnapshot, error) {
 			Bounds: decodeRect(&value), Color: decodeColor(&value), Radius: value.f32(), Layer: value.u16(),
 			ClipOf: decodeRect(&value), HasClip: value.bool(),
 		}
+	}
+	triangleCount := decodeCount(&value)
+	result.Triangles = make([]ui.Triangle, triangleCount)
+	for index := range result.Triangles {
+		var triangle ui.Triangle
+		for i := range triangle.Points {
+			triangle.Points[i] = ui.Point{X: value.f32(), Y: value.f32()}
+		}
+		triangle.Color = decodeColor(&value)
+		triangle.Shade[0] = decodeColor(&value)
+		triangle.Shade[1] = decodeColor(&value)
+		triangle.Shaded = value.bool()
+		triangle.Layer = value.u16()
+		triangle.EdgeMask = value.u8()
+		triangle.ClipOf = decodeRect(&value)
+		triangle.HasClip = value.bool()
+		triangle.RectsBefore = value.u32()
+		result.Triangles[index] = triangle
 	}
 	shadowCount := decodeCount(&value)
 	result.Shadows = make([]ui.Shadow, shadowCount)
@@ -624,6 +669,15 @@ func decodeCanvas(data []byte) (CanvasSnapshot, error) {
 			text.RunFirst, text.RunCount = 0, 0
 		}
 		text.Layer, text.ClipOf, text.HasClip = value.u16(), decodeRect(&value), value.bool()
+		text.HasQuad = value.bool()
+		if text.HasQuad {
+			for i := range text.Quad {
+				text.Quad[i] = ui.Point{X: value.f32(), Y: value.f32()}
+			}
+			for i := range text.Tint {
+				text.Tint[i] = decodeColor(&value)
+			}
+		}
 		result.Texts[index] = text
 	}
 	hitCount := decodeCount(&value)

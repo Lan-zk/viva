@@ -17,12 +17,20 @@ func TestCanvasCodecPreservesRetainedOutput(t *testing.T) {
 	canvas.PushLayer(7)
 	canvas.Clip(ui.Rect{X: 2, Y: 3, Width: 90, Height: 40})
 	canvas.Fill(ui.Rect{X: 0, Y: 0, Width: 100, Height: 50}, ui.Color{Alpha: 1})
+	canvas.FillQuad(ui.Quad{
+		Points: [4]ui.Point{{X: 10, Y: 10}, {X: 40, Y: 12}, {X: 8, Y: 38}, {X: 42, Y: 40}},
+		Tint:   [4]ui.Color{{Red: 1, Alpha: 1}, {Green: 1, Alpha: 1}, {Blue: 1, Alpha: 1}, {Alpha: 1}},
+	})
 	canvas.Elevate(ui.Rect{X: 1, Y: 2, Width: 80, Height: 30}, 6, ui.ShadowMD)
 	canvas.Rounded(ui.Rect{X: 1, Y: 2, Width: 80, Height: 30}, 6, ui.Color{Red: 0.2, Green: 0.3, Blue: 0.4, Alpha: 1})
 	canvas.DrawBitmapRegion(ui.Bitmap{
 		Pix: []byte{0, 0, 255, 255, 0, 255, 0, 255}, Width: 2, Height: 1, Stride: 8, ID: 55, Version: 2,
 	}, ui.Rect{X: 1, Width: 1, Height: 1}, ui.Rect{X: 10, Y: 10, Width: 20, Height: 10})
 	canvas.Label("reload", ui.Rect{X: 5, Y: 6, Width: 50, Height: 14}, ui.TextStyle{Size: 12, Weight: 600, Italic: true, Color: ui.Color{Alpha: 1}})
+	canvas.LabelQuad("warped", ui.Rect{X: 12, Y: 20, Width: 48, Height: 16}, ui.Quad{
+		Points: [4]ui.Point{{X: 12, Y: 20}, {X: 56, Y: 22}, {X: 12, Y: 36}, {X: 56, Y: 38}},
+		Tint:   [4]ui.Color{{Red: 1, Green: 1, Blue: 1, Alpha: 1}, {Red: 0.9, Green: 0.9, Blue: 0.9, Alpha: 1}, {Red: 1, Green: 1, Blue: 1, Alpha: 1}, {Red: 0.9, Green: 0.9, Blue: 0.9, Alpha: 1}},
+	}, ui.TextStyle{Size: 12, Color: ui.Color{Alpha: 1}})
 	canvas.Unclip()
 	canvas.PopLayer()
 	canvas.PushLayer(600)

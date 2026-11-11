@@ -182,6 +182,14 @@ typedef struct {
     // Where layout put the text, less x and y, in logical pixels (platform.TextLabel.OriginX).
     float origin_x;
     float origin_y;
+    // When quad holds any value other than all zeros the label paints that
+    // shape instead of x, y, width, height: the four corners in the order
+    // top-left, top-right, bottom-left, bottom-right, in logical pixels, and the
+    // straight RGBA colour multiplied into the pixels at each corner
+    // (platform.TextLabel.Quad). x, y, width and height stay the rasterisation
+    // box, so the picture of the label is what the quad places.
+    float quad[8];
+    float tint[16];
 } viva_text_label;
 
 // viva_clip is the region, in logical pixels, that one rectangle or triangle

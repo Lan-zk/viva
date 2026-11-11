@@ -339,6 +339,16 @@ type TextLabel struct {
 	// BitmapUpload is true only when Bitmap content must cross a native
 	// boundary. A false bitmap label references the matching retained texture.
 	BitmapUpload bool
+	// Quad, while HasQuad, is the shape the label paints instead of the
+	// axis-aligned X, Y, Width, Height rectangle: the four corners (top-left,
+	// top-right, bottom-left, bottom-right) in logical pixels, and the straight
+	// RGBA colour multiplied into the pixels drawn at each. X, Y, Width and
+	// Height stay the rasterisation box, which is where the text is laid out.
+	// See ui.Canvas.LabelQuad. A backend that cannot draw a general quad paints
+	// the label in its box instead.
+	Quad    [4]ui.Point
+	Tint    [4]Color
+	HasQuad bool
 }
 
 // PressKind is what a press at a window point does in a custom-titlebar window

@@ -2356,6 +2356,11 @@ static uint64_t viva_label_content_hash(viva_text_label config) {
     uint64_t _bitmapID;
     uint32_t _bitmapVersion;
     id<MTLTexture> _texture;
+    // The shape the label's picture is drawn into this frame, and the colour
+    // multiplied into each of its corners (viva_text_label.quad, .tint).
+    float _quad[8];
+    float _tint[16];
+    BOOL _hasQuad;
 }
 - (instancetype)initWithConfig:(viva_text_label)config;
 - (BOOL)matchesConfig:(viva_text_label)config;
@@ -2363,6 +2368,10 @@ static uint64_t viva_label_content_hash(viva_text_label config) {
 - (BOOL)contentMatchesSizeAgnostic:(viva_text_label)config;
 - (void)updateFrame:(NSRect)frame;
 - (void)updateClipFromConfig:(viva_text_label)config;
+- (void)updateQuadFromConfig:(viva_text_label)config;
+- (BOOL)hasQuad;
+- (const float *)quad;
+- (const float *)tint;
 - (BOOL)clipped;
 - (NSRect)clip;
 - (void)forceTextureRebuildWithDevice:(id<MTLDevice>)device scale:(CGFloat)scale;
@@ -2462,6 +2471,7 @@ static BOOL viva_bitmap_extent_stale(size_t have, size_t need) {
         }
         _frame = NSMakeRect(config.x, config.y, config.width, config.height);
         [self updateClipFromConfig:config];
+        [self updateQuadFromConfig:config];
         _fontSize = config.font_size;
         _fontWeight = config.font_weight;
         _italic = (config.flags & VIVA_LABEL_ITALIC) != 0;
@@ -2581,6 +2591,51 @@ static BOOL viva_bitmap_extent_stale(size_t have, size_t need) {
 - (void)updateClipFromConfig:(viva_text_label)config {
     _clipped = (config.flags & VIVA_LABEL_CLIPPED) != 0;
     _clip = _clipped ? NSMakeRect(config.clip_x, config.clip_y, config.clip_width, config.clip_height) : NSZeroRect;
+}
+
+- (void)updateQuadFromConfig:(viva_text_label)config {
+    // The quad is where the label lands, not what it looks like: it changes
+    // every frame of an animation while the texture stays the same one.
+    BOOL hasQuad = NO;
+    for (int index = 0; index < 8; index++) {
+        _quad[index] = config.quad[index];
+        hasQuad = hasQuad || config.quad[index] != 0;
+    }
+    _hasQuad = hasQuad;
+    for (int index = 0; index < 16; index++) {
+        _tint[index] = config.tint[index];
+    }
+    if (hasQuad) {
+        return;
+    }
+    // An ordinary label keeps its box as the quad, so the encoder has no case
+    // to special-case per frame.
+    _quad[0] = config.x;
+    _quad[1] = config.y;
+    _quad[2] = config.x + config.width;
+    _quad[3] = config.y;
+    _quad[4] = config.x;
+    _quad[5] = config.y + config.height;
+    _quad[6] = config.x + config.width;
+    _quad[7] = config.y + config.height;
+    for (int index = 0; index < 4; index++) {
+        _tint[index * 4] = 1;
+        _tint[index * 4 + 1] = 1;
+        _tint[index * 4 + 2] = 1;
+        _tint[index * 4 + 3] = 1;
+    }
+}
+
+- (BOOL)hasQuad {
+    return _hasQuad;
+}
+
+- (const float *)quad {
+    return _quad;
+}
+
+- (const float *)tint {
+    return _tint;
 }
 
 - (BOOL)clipped {
@@ -2957,16 +3012,28 @@ static int viva_update_label_layers(
         [replacement release];
         return status;
     }
+    // Track which VivaTextLayer instances have already been added to
+    // replacement in this frame. Two labels with identical text, font, size,
+    // and colour (for instance, a static page and a warped turning sheet in the
+    // same frame) must not share the same mutable VivaTextLayer object, or the
+    // second label's updateQuadFromConfig:/updateFrame: will overwrite the
+    // first label's placement!
+    NSMutableSet<VivaTextLayer *> *placed = [NSMutableSet setWithCapacity:count];
     for (NSUInteger index = 0; index < count; index++) {
         VivaTextLayer *existing = nil;
-        if (source[index] >= 0 && [previous[(NSUInteger)source[index]] matchesConfig:labels[index]]) {
-            existing = previous[(NSUInteger)source[index]];
+        if (source[index] >= 0) {
+            VivaTextLayer *candidate = previous[(NSUInteger)source[index]];
+            if (![placed containsObject:candidate] && [candidate matchesConfig:labels[index]]) {
+                existing = candidate;
+            }
         }
         if (existing != nil) {
+            [placed addObject:existing];
             [existing updateFrame:NSMakeRect(
                 labels[index].x, labels[index].y,
                 labels[index].width, labels[index].height)];
             [existing updateClipFromConfig:labels[index]];
+            [existing updateQuadFromConfig:labels[index]];
             // An image drawn at a new size may need a texture of another resolution.
             if ((labels[index].flags & VIVA_LABEL_BITMAP) != 0 && ![existing rebuildWithDevice:device scale:scale]) {
                 free(source);
@@ -2985,12 +3052,38 @@ static int viva_update_label_layers(
             return failure;
         }
         [layer markContentRebuild];
+        [placed addObject:layer];
         [replacement addObject:layer];
         [layer release];
     }
     free(source);
     *updated = replacement;
     return 0;
+}
+
+// viva_label_box_quad writes the four corners of an axis-aligned box in the
+// order the text vertex shader expects them: top-left, top-right, bottom-left,
+// bottom-right.
+static void viva_label_box_quad(float *quad, float x, float y, float width, float height) {
+    quad[0] = x;
+    quad[1] = y;
+    quad[2] = x + width;
+    quad[3] = y;
+    quad[4] = x;
+    quad[5] = y + height;
+    quad[6] = x + width;
+    quad[7] = y + height;
+}
+
+// viva_label_plain_tint writes the colour that leaves a label's pixels as they
+// are: opaque white at every corner.
+static void viva_label_plain_tint(float *tint) {
+    for (int index = 0; index < 4; index++) {
+        tint[index * 4] = 1;
+        tint[index * 4 + 1] = 1;
+        tint[index * 4 + 2] = 1;
+        tint[index * 4 + 3] = 1;
+    }
 }
 
 // viva_encode_input draws the native editor's texture.
@@ -3002,14 +3095,15 @@ static void viva_encode_input(
     NSSize viewport
 ) {
     float viewportSize[2] = {(float)viewport.width, (float)viewport.height};
-    float bounds[4] = {
-        (float)inputFrame.origin.x,
-        (float)inputFrame.origin.y,
-        (float)inputFrame.size.width,
-        (float)inputFrame.size.height,
-    };
+    float quad[8];
+    viva_label_box_quad(quad,
+                        (float)inputFrame.origin.x, (float)inputFrame.origin.y,
+                        (float)inputFrame.size.width, (float)inputFrame.size.height);
+    float tint[16];
+    viva_label_plain_tint(tint);
     [encoder setRenderPipelineState:textPipeline];
-    [encoder setVertexBytes:&bounds length:sizeof(bounds) atIndex:0];
+    [encoder setVertexBytes:quad length:sizeof(quad) atIndex:2];
+    [encoder setVertexBytes:tint length:sizeof(tint) atIndex:3];
     [encoder setVertexBytes:&viewportSize length:sizeof(viewportSize) atIndex:1];
     [encoder setFragmentTexture:inputTexture atIndex:0];
     [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
@@ -3084,7 +3178,6 @@ static void viva_encode_scene(
         }
 
         VivaTextLayer *layer = [labels objectAtIndex:command.first];
-        NSRect frame = [layer frame];
         BOOL scissored = NO;
         if ([layer clipped]) {
             NSRect clip = [layer clip];
@@ -3099,14 +3192,15 @@ static void viva_encode_scene(
             [encoder setScissorRect:scissor];
             scissored = YES;
         }
-        float bounds[4] = {
-            (float)frame.origin.x,
-            (float)frame.origin.y,
-            (float)frame.size.width,
-            (float)frame.size.height,
-        };
+        // The label's picture is drawn into the quad its layer carries, which is
+        // its frame unless the canvas warped it (ui.Canvas.LabelQuad).
+        float quad[8];
+        memcpy(quad, [layer quad], sizeof(quad));
+        float tint[16];
+        memcpy(tint, [layer tint], sizeof(tint));
         [encoder setRenderPipelineState:textPipeline];
-        [encoder setVertexBytes:&bounds length:sizeof(bounds) atIndex:0];
+        [encoder setVertexBytes:quad length:sizeof(quad) atIndex:2];
+        [encoder setVertexBytes:tint length:sizeof(tint) atIndex:3];
         [encoder setVertexBytes:&viewportSize length:sizeof(viewportSize) atIndex:1];
         [encoder setFragmentTexture:[layer texture] atIndex:0];
         [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
@@ -6322,7 +6416,7 @@ void *viva_application_open_window(viva_window_config config) {
         id<MTLBuffer> rectangleBuffer = nil;
         if (config.shader_library != NULL && config.shader_library_length > 0) {
             _Static_assert(sizeof(viva_rectangle) == 80, "rectangle ABI must be 80 bytes");
-            _Static_assert(sizeof(viva_text_label) == 160, "text label ABI must be 160 bytes");
+            _Static_assert(sizeof(viva_text_label) == 256, "text label ABI must be 256 bytes");
             _Static_assert(sizeof(viva_text_run) == 36, "text run ABI must be 36 bytes");
             _Static_assert(sizeof(viva_composite_command) == 32, "composite command ABI must be 32 bytes");
             dispatch_data_t libraryData = dispatch_data_create(

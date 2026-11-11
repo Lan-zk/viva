@@ -1457,7 +1457,11 @@ func (painter *painter) applyClipping() {
 			continue
 		}
 		if text.HasClip {
-			if _, visible := intersectVisible(text.Bounds, text.ClipOf); !visible {
+			footprint := text.Bounds
+			if text.HasQuad {
+				footprint = quadBounds(text.Quad)
+			}
+			if _, visible := intersectVisible(footprint, text.ClipOf); !visible {
 				continue
 			}
 		}
@@ -1549,6 +1553,14 @@ func triangleBounds(points [3]ui.Point) ui.Rect {
 	top := min32(points[0].Y, min32(points[1].Y, points[2].Y))
 	right := max32(points[0].X, max32(points[1].X, points[2].X))
 	bottom := max32(points[0].Y, max32(points[1].Y, points[2].Y))
+	return ui.Rect{X: left, Y: top, Width: right - left, Height: bottom - top}
+}
+
+func quadBounds(points [4]ui.Point) ui.Rect {
+	left := min32(min32(points[0].X, points[1].X), min32(points[2].X, points[3].X))
+	top := min32(min32(points[0].Y, points[1].Y), min32(points[2].Y, points[3].Y))
+	right := max32(max32(points[0].X, points[1].X), max32(points[2].X, points[3].X))
+	bottom := max32(max32(points[0].Y, points[1].Y), max32(points[2].Y, points[3].Y))
 	return ui.Rect{X: left, Y: top, Width: right - left, Height: bottom - top}
 }
 
@@ -2194,9 +2206,26 @@ func (painter *painter) syncLabels() {
 			// The font does not draw Block Elements; appendBlockElements did.
 			entry.Value, entry.Runs = ui.ReplaceBlockElements(entry.Value, entry.Runs)
 		}
-		if label.HasClip && !containsRect(label.ClipOf, label.Bounds) {
-			// The clip cuts the label partway: the renderers scissor to it.
-			entry.Clip, entry.Clipped = label.ClipOf, true
+		if label.HasClip {
+			footprint := label.Bounds
+			if label.HasQuad {
+				footprint = quadBounds(label.Quad)
+			}
+			if !containsRect(label.ClipOf, footprint) {
+				// The clip cuts the label partway: the renderers scissor to it.
+				entry.Clip, entry.Clipped = label.ClipOf, true
+			}
+		}
+		if label.HasQuad {
+			// A warped line keeps its rasterisation box and moves only where the
+			// picture lands, so the platform draws the same texture as a quad.
+			entry.Quad, entry.HasQuad = label.Quad, true
+			for index, tint := range label.Tint {
+				entry.Tint[index] = platform.Color{
+					Red: float64(tint.Red), Green: float64(tint.Green),
+					Blue: float64(tint.Blue), Alpha: float64(tint.Alpha),
+				}
+			}
 		}
 		painter.labels = append(painter.labels, entry)
 	}
@@ -2394,6 +2423,11 @@ func (painter *painter) sameAsLastContent() bool {
 			return false
 		}
 		if a.HasClip != b.HasClip || a.HasClip && a.ClipOf != b.ClipOf {
+			return false
+		}
+		// Where a warped line lands changes every frame of an animation while
+		// its picture stays the same: the platform must still see the new quad.
+		if a.HasQuad != b.HasQuad || a.Quad != b.Quad || a.Tint != b.Tint {
 			return false
 		}
 		if a.RunCount == 0 {

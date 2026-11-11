@@ -323,7 +323,6 @@ func vivaAccessibilityAction(handle C.uintptr_t, view unsafe.Pointer, node C.uin
 		return 0
 	}
 	handled, err := state.accessibility(request, func(frame Frame) error {
-		state.captureFrameLayers(frame, nil)
 		return presentFrame(state, view, frame, false)
 	})
 	if err != nil {
@@ -538,6 +537,13 @@ func planTextEvent(terminal bool, previous, next TextState) textEventPlan {
 }
 
 func presentFrame(state *runState, view unsafe.Pointer, frame Frame, syncRender bool) error {
+	// The native layer stamps every rectangle with the layer from this
+	// snapshot before it uploads them, so it must be current for every frame.
+	// Capturing only on some paths left stale layers behind whenever a frame
+	// changed the number of rectangles, which put shapes on the wrong layer.
+	if state != nil {
+		state.captureFrameLayers(frame, nil)
+	}
 	if err := presentTextInput(state, view, frame.TextInput); err != nil {
 		return err
 	}

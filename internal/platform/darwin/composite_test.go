@@ -15,11 +15,11 @@ func TestCompositeABI(t *testing.T) {
 	if rectangleSize != 80 || rectangleLayerOffset != 36 {
 		t.Fatalf("viva_rectangle ABI = size %d layer offset %d, want 80 and 36", rectangleSize, rectangleLayerOffset)
 	}
-	if textSize != 160 || textLayerOffset != 56 {
-		t.Fatalf("viva_text_label ABI = size %d layer offset %d, want 160 and 56", textSize, textLayerOffset)
+	if textSize != 256 || textLayerOffset != 56 {
+		t.Fatalf("viva_text_label ABI = size %d layer offset %d, want 256 and 56", textSize, textLayerOffset)
 	}
-	if labelSize, runsOffset, runSize := labelABI(); labelSize != 160 || runsOffset != 64 || runSize != 36 {
-		t.Fatalf("label ABI = size %d runs offset %d run size %d, want 160, 64 and 36", labelSize, runsOffset, runSize)
+	if labelSize, runsOffset, runSize := labelABI(); labelSize != 256 || runsOffset != 64 || runSize != 36 {
+		t.Fatalf("label ABI = size %d runs offset %d run size %d, want 256, 64 and 36", labelSize, runsOffset, runSize)
 	}
 	if commandSize != 32 {
 		t.Fatalf("viva_composite_command size = %d, want 32", commandSize)
